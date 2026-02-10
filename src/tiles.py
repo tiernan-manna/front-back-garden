@@ -1,12 +1,9 @@
 """
-Google Map Tiles API fetcher module
+Multi-Source Tile Fetcher Module
 
-Fetches aerial/satellite imagery tiles from Google Map Tiles API
-and stitches them into a single image for a given area.
-
-Uses the Map Tiles API which requires:
-1. Creating a session token first
-2. Using that session for all tile requests
+Fetches aerial/satellite imagery tiles from multiple sources:
+1. Google Map Tiles API
+2. Manna Tiles API (internal)
 
 Includes caching support to avoid re-fetching tiles for the same area.
 """
@@ -15,9 +12,10 @@ import hashlib
 import json
 import math
 import os
+from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Callable
 
 import numpy as np
 import requests
@@ -29,9 +27,20 @@ import config
 # Cache directory
 CACHE_DIR = Path(config.OUTPUT_DIR) / "cache"
 
-# Global session token cache
+# Global session token cache (for Google)
 _session_token = None
 _session_expiry = None
+
+
+class TileSource(Enum):
+    """Available tile sources."""
+    GOOGLE = "google"
+    MANNA = "manna"
+    AUTO = "auto"  # Automatically choose best available
+
+
+# Default tile source
+DEFAULT_TILE_SOURCE = TileSource.GOOGLE
 
 
 def get_cache_key(center_lat: float, center_lon: float, radius_m: float, zoom: int) -> str:
@@ -147,6 +156,93 @@ def clear_cache():
         shutil.rmtree(CACHE_DIR)
         print("Cache cleared.")
 
+
+# =============================================================================
+# MANNA TILE SOURCE
+# =============================================================================
+
+def get_manna_tile_url() -> Optional[str]:
+    """
+    Get the Manna tiles API URL from config.
+    
+    Returns:
+        Manna tiles URL or None if not configured
+    """
+    return getattr(config, 'MANNA_TILES_URL', None)
+
+
+def fetch_manna_tile(
+    tile_x: int,
+    tile_y: int,
+    zoom: int,
+    http_session: Optional[requests.Session] = None
+) -> Optional[Image.Image]:
+    """
+    Fetch a single tile from Manna Tiles API.
+    
+    Manna tiles use standard XYZ tile format.
+    
+    Args:
+        tile_x: Tile X coordinate
+        tile_y: Tile Y coordinate
+        zoom: Zoom level
+        http_session: Optional requests session for connection pooling
+        
+    Returns:
+        PIL Image or None if fetch failed
+    """
+    manna_url = get_manna_tile_url()
+    if not manna_url:
+        return None
+    
+    # Build URL - Manna uses standard {z}/{x}/{y} format
+    url = manna_url.format(z=zoom, x=tile_x, y=tile_y)
+    
+    # Add API key if configured
+    manna_api_key = getattr(config, 'MANNA_API_KEY', None)
+    headers = {}
+    if manna_api_key:
+        headers['Authorization'] = f'Bearer {manna_api_key}'
+    
+    try:
+        requester = http_session if http_session else requests
+        response = requester.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        img = Image.open(BytesIO(response.content))
+        return img.convert("RGB")
+        
+    except requests.RequestException:
+        return None
+
+
+def check_manna_tile_availability(
+    center_lat: float,
+    center_lon: float,
+    zoom: int = 19
+) -> bool:
+    """
+    Check if Manna tiles are available for a location.
+    
+    Args:
+        center_lat: Center latitude
+        center_lon: Center longitude
+        zoom: Zoom level
+        
+    Returns:
+        True if Manna tiles are available
+    """
+    if not get_manna_tile_url():
+        return False
+    
+    tile_x, tile_y = lat_lon_to_tile(center_lat, center_lon, zoom)
+    tile = fetch_manna_tile(tile_x, tile_y, zoom)
+    return tile is not None
+
+
+# =============================================================================
+# GOOGLE TILE SOURCE
+# =============================================================================
 
 def create_map_tiles_session(api_key: str) -> str:
     """
@@ -384,10 +480,16 @@ def fetch_area_image(
     radius_m: float,
     zoom: int = None,
     show_progress: bool = True,
-    use_cache: bool = True
+    use_cache: bool = True,
+    tile_source: TileSource = None
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Fetch and stitch all tiles for an area into a single image.
+    
+    Supports multiple tile sources:
+    - Google Map Tiles API
+    - Manna Tiles API
+    - Auto (tries Manna first, falls back to Google)
     
     Args:
         center_lat: Center latitude
@@ -396,6 +498,7 @@ def fetch_area_image(
         zoom: Zoom level (uses config default if None)
         show_progress: Show progress bar
         use_cache: Whether to use cached tiles if available
+        tile_source: Tile source to use (default: AUTO)
         
     Returns:
         Tuple of:
@@ -404,6 +507,9 @@ def fetch_area_image(
     """
     if zoom is None:
         zoom = config.ZOOM_LEVEL
+    
+    if tile_source is None:
+        tile_source = DEFAULT_TILE_SOURCE
     
     # Check cache first
     if use_cache:
@@ -417,19 +523,49 @@ def fetch_area_image(
         center_lat, center_lon, radius_m, zoom
     )
     
+    # Determine which tile source to use
+    use_manna = False
+    use_google = False
+    
+    if tile_source == TileSource.AUTO:
+        # Try Manna first
+        if check_manna_tile_availability(center_lat, center_lon, zoom):
+            use_manna = True
+            print(f"Using Manna tiles (better coverage for this area)")
+        elif config.GOOGLE_TILES_API_KEY:
+            use_google = True
+            print(f"Using Google tiles (Manna not available)")
+        else:
+            print("No tile source available - using placeholder")
+            return create_placeholder_image(center_lat, center_lon, radius_m, zoom)
+    elif tile_source == TileSource.MANNA:
+        if get_manna_tile_url():
+            use_manna = True
+        else:
+            print("Manna tiles not configured - falling back to Google")
+            use_google = True
+    else:  # TileSource.GOOGLE
+        use_google = True
+    
     print(f"Fetching {len(tiles)} tiles at zoom {zoom}...")
     
-    # Create Map Tiles API session first
-    try:
-        session_token = get_session_token()
-    except Exception as e:
-        print(f"❌ {e}")
-        print("\nTo fix this, ensure the Map Tiles API is enabled:")
-        print("  1. Go to: https://console.cloud.google.com/apis/library")
-        print("  2. Search for 'Map Tiles API'")
-        print("  3. Click 'Enable'")
-        print("\nFalling back to placeholder image...")
-        return create_placeholder_image(center_lat, center_lon, radius_m, zoom)
+    # Create session token for Google if needed
+    session_token = None
+    if use_google:
+        try:
+            session_token = get_session_token()
+        except Exception as e:
+            print(f"❌ {e}")
+            if use_manna:
+                print("Falling back to Manna tiles...")
+                use_google = False
+            else:
+                print("\nTo fix this, ensure the Map Tiles API is enabled:")
+                print("  1. Go to: https://console.cloud.google.com/apis/library")
+                print("  2. Search for 'Map Tiles API'")
+                print("  3. Click 'Enable'")
+                print("\nFalling back to placeholder image...")
+                return create_placeholder_image(center_lat, center_lon, radius_m, zoom)
     
     # Calculate output image size
     width_tiles = max_x - min_x + 1
@@ -448,7 +584,21 @@ def fetch_area_image(
     iterator = tqdm(tiles, desc="Fetching tiles") if show_progress else tiles
     
     for tile_x, tile_y in iterator:
-        tile_img = fetch_tile(tile_x, tile_y, zoom, session_token, http_session)
+        tile_img = None
+        
+        # Try primary source first
+        if use_manna:
+            tile_img = fetch_manna_tile(tile_x, tile_y, zoom, http_session)
+        
+        # Fall back to Google if Manna fails
+        if tile_img is None and (use_google or (use_manna and session_token)):
+            if session_token is None:
+                try:
+                    session_token = get_session_token()
+                except Exception:
+                    pass
+            if session_token:
+                tile_img = fetch_tile(tile_x, tile_y, zoom, session_token, http_session)
         
         if tile_img:
             # Calculate position in output image
@@ -468,7 +618,8 @@ def fetch_area_image(
         else:
             print(f"Warning: {len(failed_tiles)} tiles failed to fetch")
     else:
-        print(f"✅ Successfully fetched {successful_tiles} tiles")
+        source_name = "Manna" if use_manna else "Google"
+        print(f"✅ Successfully fetched {successful_tiles} tiles from {source_name}")
     
     # Calculate geographic bounds
     top_lat, left_lon = tile_to_lat_lon(min_x, min_y, zoom)
@@ -489,6 +640,7 @@ def fetch_area_image(
         "image_size": [output_width, output_height],  # Use list for JSON serialization
         "tiles_fetched": successful_tiles,
         "tiles_failed": len(failed_tiles),
+        "tile_source": "manna" if use_manna else "google",
     }
     
     image_array = np.array(output)

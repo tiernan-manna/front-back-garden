@@ -20,6 +20,18 @@ except ImportError:
 GOOGLE_TILES_URL = "https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}"
 
 # =============================================================================
+# MANNA TILES API CONFIGURATION (Alternative tile source)
+# =============================================================================
+
+# Try to load Manna config from config_local.py (gitignored)
+try:
+    from config_local import MANNA_TILES_URL, MANNA_API_KEY
+except ImportError:
+    # No Manna config - set to None (will use Google)
+    MANNA_TILES_URL = None  # e.g., "https://tiles.manna.aero/{z}/{x}/{y}"
+    MANNA_API_KEY = None
+
+# =============================================================================
 # TARGET LOCATION - Blanchardstown, Dublin 15
 # =============================================================================
 
