@@ -129,7 +129,8 @@ class DeliveryPinFinder:
         center_lat: float,
         center_lon: float,
         meters_per_pixel: float = None,
-        building_directions: Dict = None
+        building_directions: Dict = None,
+        property_boundaries: gpd.GeoDataFrame = None
     ):
         """
         Initialize the delivery pin finder.
@@ -146,12 +147,14 @@ class DeliveryPinFinder:
             center_lon: Center longitude
             meters_per_pixel: Meters per pixel (calculated if not provided)
             building_directions: Dict mapping building idx to direction info (from GardenClassifier)
+            property_boundaries: GeoDataFrame with fences/walls/hedges from OSM
         """
         self.classification_mask = classification_mask
         self.vegetation_mask = vegetation_mask
         self.buildings = buildings
         self.roads = roads
         self.driveways = driveways
+        self.property_boundaries = property_boundaries
         self.geo_bounds = geo_bounds
         self.image_size = image_size
         self.center_lat = center_lat
@@ -273,6 +276,127 @@ class DeliveryPinFinder:
         # Distance from roads (in pixels)
         road_binary = self.road_mask > 0
         self.distance_to_road = distance_transform_edt(~road_binary)
+    
+    def _precompute_vegetation_analysis(self):
+        """
+        Precompute vegetation statistics for graduated scoring.
+        
+        NOTE: Tree detection is now handled UPSTREAM via texture analysis in
+        garden_detector.split_vegetation_by_texture(). The vegetation_mask
+        passed to this class already contains only grass pixels (trees excluded).
+        
+        Creates:
+        - _green_density_large: Grass pixel density in ~10m radius (float32)
+        - _tree_mask: All-false mask (trees already filtered at source)
+        - _veg_labels: Connected component labels for grass areas
+        - _component_areas_m2: Area in m² per component label (1D, indexed by label)
+        """
+        from scipy.ndimage import uniform_filter
+        
+        veg_binary = (self.vegetation_mask > 0).astype(np.float32)
+        
+        # Grass density at large scale (~10m) for quality scoring
+        self._green_density_large = uniform_filter(veg_binary, size=31).astype(np.float32)
+        
+        # Connected component analysis on grass-only mask
+        veg_uint8 = (self.vegetation_mask > 0).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(veg_uint8, connectivity=8)
+        
+        self._veg_labels = labels
+        
+        # Per-component area in m²
+        self._component_areas_m2 = stats[:, cv2.CC_STAT_AREA].astype(np.float32) * (self.meters_per_pixel ** 2)
+        
+        # No tree detection needed - trees were filtered out upstream by texture analysis.
+        # Set tree mask to all-false for compatibility with downstream scoring code.
+        self._is_tree_component = np.zeros(num_labels, dtype=bool)
+        self._tree_mask = np.zeros_like(labels, dtype=bool)
+        
+        # Minimum area filter: grass components < 5m² are likely tree canopy fragments
+        # or hedge overhangs, not real garden areas worth pinning
+        self._large_enough = self._component_areas_m2 >= 5.0
+        self._large_enough[0] = False  # Background label
+        
+        total_components = num_labels - 1
+        large_components = int(np.sum(self._large_enough)) - (1 if self._large_enough[0] else 0)
+        print(f"    Grass components: {total_components} total, {large_components} >= 5m² (trees filtered by texture)")
+    
+    def _get_building_centroid_geo(self, building_idx: int) -> Tuple[float, float]:
+        """Get geographic centroid (lat, lon) of a building by its list index."""
+        building = self.buildings.iloc[building_idx]
+        centroid = building.geometry.centroid
+        return centroid.y, centroid.x
+    
+    def _precompute_property_zones(self):
+        """
+        Segment the image into property zones using physical boundaries.
+        
+        Uses buildings, roads, driveways, and fences/walls/hedges as barriers
+        to create isolated property parcels. Each building is then mapped to
+        its adjacent zones.
+        
+        A pin for building X can ONLY be placed within building X's zones.
+        This prevents pins from crossing property boundaries into neighbors.
+        
+        Creates:
+        - _property_zones: int32 array, zone label per pixel (0 = barrier)
+        - _building_zones: dict mapping building_idx to set of adjacent zone labels
+        """
+        from src.osm import geometry_to_pixel_coords
+        
+        # Ensure building_owner is computed (needed for zone mapping)
+        if not hasattr(self, 'building_owner'):
+            self._precompute_building_zones()
+        
+        height, width = self.classification_mask.shape
+        
+        # Create barrier mask from all physical boundaries
+        barrier = (self.building_mask > 0).astype(np.uint8) * 255
+        barrier = np.maximum(barrier, self.road_mask)
+        barrier = np.maximum(barrier, self.driveway_mask)
+        
+        # Add property boundaries (fences, walls, hedges) from OSM
+        boundary_count = 0
+        if self.property_boundaries is not None and not self.property_boundaries.empty:
+            for _, boundary in self.property_boundaries.iterrows():
+                geom = boundary.geometry
+                if geom is None or geom.is_empty:
+                    continue
+                try:
+                    if geom.geom_type in ('LineString', 'MultiLineString'):
+                        lines = list(geom.geoms) if geom.geom_type == 'MultiLineString' else [geom]
+                        for line in lines:
+                            coords = geometry_to_pixel_coords(line, self.geo_bounds, self.image_size)
+                            if coords and len(coords) >= 2:
+                                pts = np.array(coords, dtype=np.int32)
+                                cv2.polylines(barrier, [pts], False, 255, thickness=3)
+                                boundary_count += 1
+                    elif geom.geom_type in ('Polygon', 'MultiPolygon'):
+                        coords = geometry_to_pixel_coords(geom, self.geo_bounds, self.image_size)
+                        if coords and len(coords) >= 3:
+                            pts = np.array(coords, dtype=np.int32)
+                            cv2.polylines(barrier, [pts], True, 255, thickness=3)
+                            boundary_count += 1
+                except Exception:
+                    continue
+        
+        # Label connected components of non-barrier pixels (connectivity=4 for strict separation)
+        non_barrier = (barrier == 0).astype(np.uint8)
+        num_zones, zone_labels = cv2.connectedComponents(non_barrier, connectivity=4)
+        self._property_zones = zone_labels.astype(np.int32)
+        
+        # Map each building to its adjacent property zones
+        # Use building_owner + proximity: find zones within 3m of each building
+        close_to_building = (self.distance_to_building * self.meters_per_pixel) <= 3
+        valid_pixels = close_to_building & (zone_labels > 0)
+        
+        self._building_zones = {}
+        for building_idx in range(len(self.buildings)):
+            mask = valid_pixels & (self.building_owner == building_idx)
+            zones = set(int(z) for z in np.unique(zone_labels[mask]) if z > 0)
+            self._building_zones[building_idx] = zones
+        
+        print(f"    Property zones: {num_zones} zones from {boundary_count} OSM boundaries")
     
     def _precompute_building_zones(self):
         """
@@ -451,14 +575,25 @@ class DeliveryPinFinder:
         if building_idx >= len(self.buildings):
             return None
         
-        # Lazy-init the zone map on first call
+        # Lazy-init precomputed data on first call
         if not hasattr(self, 'building_owner'):
             self._precompute_building_zones()
+        if not hasattr(self, '_tree_mask'):
+            self._precompute_vegetation_analysis()
+        if not hasattr(self, '_property_zones'):
+            self._precompute_property_zones()
         
         building = self.buildings.iloc[building_idx]
         building_idx_original = self.buildings.index[building_idx]
         
-        # Get centroid
+        # Skip very small buildings (sheds, garages, not houses)
+        bounds = building.geometry.bounds
+        lat_m = (bounds[3] - bounds[1]) * 111320
+        lon_m = (bounds[2] - bounds[0]) * 111320 * np.cos(np.radians(self.center_lat))
+        if lat_m * lon_m * 0.7 < 30:  # < ~30m²
+            return None
+        
+        # Get centroid in pixel coordinates
         if building_idx in self._building_centroids_px:
             bld_cx, bld_cy = self._building_centroids_px[building_idx]
         else:
@@ -470,31 +605,46 @@ class DeliveryPinFinder:
         target_class = 1 if garden_type == "front" else 2
         height, width = self.classification_mask.shape
         
-        # Search radius (15m)
-        search_radius_px = int(15 / self.meters_per_pixel)
+        # Search radius (20m to catch full gardens)
+        search_radius_px = int(20 / self.meters_per_pixel)
         min_y = max(0, bld_cy - search_radius_px)
         max_y = min(height, bld_cy + search_radius_px)
         min_x = max(0, bld_cx - search_radius_px)
         max_x = min(width, bld_cx + search_radius_px)
         
-        # Extract the search region as numpy slices (FAST)
-        region_owner = self.building_owner[min_y:max_y, min_x:max_x]
+        if max_y <= min_y or max_x <= min_x:
+            return None
+        
+        # Extract the search region as numpy slices
         region_class = self.classification_mask[min_y:max_y, min_x:max_x]
         region_veg = self.vegetation_mask[min_y:max_y, min_x:max_x]
         region_bld = self.building_mask[min_y:max_y, min_x:max_x]
         region_road = self.road_mask[min_y:max_y, min_x:max_x]
-        region_dist = self.distance_to_building[min_y:max_y, min_x:max_x]
         
-        # Build candidate mask: owned by this building + correct garden type + not building/road
+        # Coordinate grids relative to building centroid (reused for distance + direction)
+        ys_rel = np.arange(min_y, max_y).reshape(-1, 1) - bld_cy
+        xs_rel = np.arange(min_x, max_x).reshape(1, -1) - bld_cx
+        dist_to_centroid_m = np.sqrt(xs_rel**2 + ys_rel**2) * self.meters_per_pixel
+        
+        # Strict Voronoi ownership: each pixel belongs to exactly ONE building
+        # (the nearest one based on building edge distance). This prevents
+        # multiple buildings from claiming the same garden area.
+        region_owner = self.building_owner[min_y:max_y, min_x:max_x]
+        
+        # Max distance from building EDGE (not centroid). Gardens are physically
+        # close to houses - vegetation > 12m away is parks/trees, not a garden.
+        region_bld_dist = self.distance_to_building[min_y:max_y, min_x:max_x]
+        max_garden_dist_m = 12.0
+        
         candidates = (
-            (region_owner == building_idx) &
             (region_class == target_class) &
             (region_bld == 0) &
             (region_road == 0) &
-            (region_dist * self.meters_per_pixel <= 12)
+            (region_owner == building_idx) &
+            (region_bld_dist * self.meters_per_pixel <= max_garden_dist_m)
         )
         
-        # Get direction info for this building
+        # Directional and lateral alignment checks
         direction_info = self.building_directions.get(building_idx_original)
         
         if direction_info is not None:
@@ -504,17 +654,11 @@ class DeliveryPinFinder:
                     rd_x = float(road_dir[0])
                     rd_y = float(road_dir[1])
                     
-                    # Create coordinate grids relative to building centroid
-                    ys = np.arange(min_y, max_y) - bld_cy
-                    xs = np.arange(min_x, max_x) - bld_cx
-                    gx, gy = np.meshgrid(xs, ys)
-                    
-                    lengths = np.sqrt(gx**2 + gy**2)
-                    lengths[lengths < 1] = 1  # avoid div by zero
-                    
-                    # Normalize direction vectors
-                    nx = gx / lengths
-                    ny = gy / lengths
+                    # Direction from centroid to each pixel (normalized)
+                    lengths = np.sqrt(xs_rel**2 + ys_rel**2)
+                    lengths = np.maximum(lengths, 1.0)
+                    nx = xs_rel / lengths
+                    ny = ys_rel / lengths
                     
                     # Dot product with road direction (Y flipped for pixel space)
                     dot = nx * rd_x + ny * (-rd_y)
@@ -524,44 +668,75 @@ class DeliveryPinFinder:
                         candidates &= (dot > -0.3)
                     else:
                         candidates &= (dot < 0.3)
-                        
-                        # Lateral alignment: project onto perpendicular axis
-                        # and check within building width + tolerance
-                        lat_x = -rd_y  # perpendicular
-                        lat_y = rd_x
-                        lat_dir_px = (lat_x, -lat_y)  # flip Y
-                        
-                        lateral_proj = gx * lat_dir_px[0] + gy * lat_dir_px[1]
-                        
-                        # Get building width along lateral axis
-                        poly = self._geometry_to_pixel_polygon(building.geometry)
-                        if poly is not None:
-                            try:
-                                coords_list = list(poly.exterior.coords)
-                                lat_positions = [
-                                    (c[0] - bld_cx) * lat_dir_px[0] + (c[1] - bld_cy) * lat_dir_px[1]
-                                    for c in coords_list
-                                ]
-                                tolerance_px = 5.0 / self.meters_per_pixel
-                                min_lat = min(lat_positions) - tolerance_px
-                                max_lat = max(lat_positions) + tolerance_px
-                                candidates &= (lateral_proj >= min_lat) & (lateral_proj <= max_lat)
-                            except Exception:
-                                pass
+                    
+                    # Lateral alignment for BOTH front and back gardens
+                    # Constrains pin to the building's width corridor,
+                    # preventing it from drifting into a neighbor's garden
+                    lat_x = -rd_y  # perpendicular to road direction
+                    lat_y = rd_x
+                    lat_dir_px = (lat_x, -lat_y)  # flip Y for pixel space
+                    
+                    lateral_proj = xs_rel * lat_dir_px[0] + ys_rel * lat_dir_px[1]
+                    
+                    poly = self._geometry_to_pixel_polygon(building.geometry)
+                    if poly is not None:
+                        try:
+                            coords_list = list(poly.exterior.coords)
+                            lat_positions = [
+                                (c[0] - bld_cx) * lat_dir_px[0] + (c[1] - bld_cy) * lat_dir_px[1]
+                                for c in coords_list
+                            ]
+                            tolerance_px = 5.0 / self.meters_per_pixel
+                            min_lat = min(lat_positions) - tolerance_px
+                            max_lat = max(lat_positions) + tolerance_px
+                            candidates &= (lateral_proj >= min_lat) & (lateral_proj <= max_lat)
+                        except Exception:
+                            pass
                 except (IndexError, TypeError, ValueError):
                     pass
         
-        # For grass candidates, filter isolated trees (need connected green area)
-        if np.any(candidates & (region_veg > 0)):
-            # Prefer grass candidates
-            grass_candidates = candidates & (region_veg > 0)
-            # Check neighborhood green density
-            from scipy.ndimage import uniform_filter
-            green_density = uniform_filter((region_veg > 0).astype(np.float32), size=11)
-            grass_candidates &= (green_density > 0.15)  # At least 15% green in 11x11 area
+        # Property zone constraint: pin must stay within the building's property
+        if building_idx in self._building_zones:
+            valid_zones = self._building_zones[building_idx]
+            if valid_zones:
+                region_zones = self._property_zones[min_y:max_y, min_x:max_x]
+                candidates &= np.isin(region_zones, list(valid_zones))
+            else:
+                # Building has no adjacent zones - can't place a pin
+                return None
+        
+        # Road-side vegetation filter: ONLY remove vegetation near roads that is
+        # also FAR from buildings (street trees, not front garden grass)
+        region_road_dist = self.distance_to_road[min_y:max_y, min_x:max_x]
+        candidates &= ~(
+            (region_veg > 0) &
+            (region_road_dist * self.meters_per_pixel < 3) &
+            (region_bld_dist * self.meters_per_pixel > 8)
+        )
+        
+        # Grass preference with quality filters
+        region_tree = self._tree_mask[min_y:max_y, min_x:max_x]
+        region_density_large = self._green_density_large[min_y:max_y, min_x:max_x]
+        region_labels = self._veg_labels[min_y:max_y, min_x:max_x]
+        
+        grass_candidates = candidates & (region_veg > 0) & (~region_tree)
+        
+        if np.any(grass_candidates):
+            # Filter out tiny grass fragments (< 5m²) - tree canopy overhangs
+            large_enough = self._large_enough[region_labels]
             
-            if np.any(grass_candidates):
-                candidates = grass_candidates
+            # Quality grass: large component + reasonable density
+            quality_grass = grass_candidates & large_enough & (region_density_large > 0.1)
+            
+            if np.any(quality_grass):
+                candidates = quality_grass
+            else:
+                # Try large grass without density check
+                basic_grass = grass_candidates & large_enough
+                if np.any(basic_grass):
+                    candidates = basic_grass
+                # else: fall through to ALL candidates (including non-veg paved areas)
+                # This allows pinning paved/concrete gardens with lower scores
         
         # Find best scoring candidate
         if not np.any(candidates):
@@ -573,34 +748,91 @@ class DeliveryPinFinder:
         if len(candidate_ys) == 0:
             return None
         
-        # Vectorized scoring: grass=100, driveway=75, else=50
-        scores = np.full(len(candidate_ys), 50.0)
+        # Graduated scoring based on surface type, garden quality, and distance
+        scores = np.full(len(candidate_ys), 35.0)
         for i, (cy_r, cx_r) in enumerate(zip(candidate_ys, candidate_xs)):
             py_abs = min_y + cy_r
             px_abs = min_x + cx_r
-            if self.vegetation_mask[py_abs, px_abs] > 0:
-                scores[i] = 100.0
-            elif self.driveway_mask[py_abs, px_abs] > 0:
-                scores[i] = 75.0
             
-            # Distance penalty
+            is_grass = (self.vegetation_mask[py_abs, px_abs] > 0 and
+                       not self._tree_mask[py_abs, px_abs])
+            is_driveway = self.driveway_mask[py_abs, px_abs] > 0
+            
+            if is_grass:
+                # Grass base score: 70
+                base = 70.0
+                
+                # Green density bonus (0-15): larger contiguous green = better garden
+                density = float(self._green_density_large[py_abs, px_abs])
+                density_bonus = min(15.0, density * 25.0)
+                
+                # Component area bonus (0-10): bigger garden = higher score
+                comp_label = self._veg_labels[py_abs, px_abs]
+                comp_area = float(self._component_areas_m2[comp_label]) if comp_label > 0 else 0.0
+                area_bonus = min(10.0, comp_area / 5.0)  # 50m² for full bonus
+                
+                scores[i] = base + density_bonus + area_bonus
+            elif is_driveway:
+                scores[i] = 60.0
+            else:
+                scores[i] = 40.0
+            
+            # Distance adjustment
             dist_m = self.distance_to_building[py_abs, px_abs] * self.meters_per_pixel
             if dist_m < 2:
-                scores[i] -= 20
+                scores[i] -= 15
+            elif dist_m < 5:
+                scores[i] += 5
+            elif dist_m < 10:
+                scores[i] += 2
             elif dist_m > 15:
-                scores[i] -= min(30, (dist_m - 15) * 2)
+                scores[i] -= min(20, (dist_m - 15) * 3)
+            
+            # Road proximity penalty
+            dist_road = self.distance_to_road[py_abs, px_abs] * self.meters_per_pixel
+            if dist_road < 2:
+                scores[i] -= 10
+            
+            # Cap by surface type
+            if is_grass:
+                scores[i] = max(0, min(100, scores[i]))
+            elif is_driveway:
+                scores[i] = max(0, min(75, scores[i]))
+            else:
+                scores[i] = max(0, min(60, scores[i]))
         
-        best_i = np.argmax(scores)
-        best_py = min_y + candidate_ys[best_i]
-        best_px = min_x + candidate_xs[best_i]
-        best_score = scores[best_i]
+        # CENTROID-BASED placement: put pin in center of garden, not at edge
+        max_score = np.max(scores)
+        if max_score <= 0:
+            return None
+        
+        # Select top-scoring candidates (within 50% of max) to define garden area
+        good_mask = scores >= max_score * 0.5
+        good_ys = candidate_ys[good_mask]
+        good_xs = candidate_xs[good_mask]
+        good_scores = scores[good_mask]
+        
+        # Compute centroid of the good candidates
+        centroid_y = np.mean(good_ys)
+        centroid_x = np.mean(good_xs)
+        
+        # Find candidate nearest to centroid (centers pin in the garden)
+        dists_to_center = (good_ys - centroid_y)**2 + (good_xs - centroid_x)**2
+        nearest_idx = np.argmin(dists_to_center)
+        
+        best_py = min_y + good_ys[nearest_idx]
+        best_px = min_x + good_xs[nearest_idx]
+        best_score = good_scores[nearest_idx]
         
         if best_score <= 0:
             return None
         
         # Determine surface type
         if self.vegetation_mask[best_py, best_px] > 0:
-            surface = "grass"
+            if self._tree_mask[best_py, best_px]:
+                surface = "tree"
+            else:
+                surface = "grass"
         elif self.driveway_mask[best_py, best_px] > 0:
             surface = "driveway"
         else:
@@ -629,8 +861,9 @@ class DeliveryPinFinder:
         self,
         include_front: bool = True,
         include_back: bool = True,
-        min_score: float = 20.0,
-        show_progress: bool = True
+        min_score: float = 0.0,
+        show_progress: bool = True,
+        include_no_garden: bool = True
     ) -> List[DeliveryPin]:
         """
         Find delivery pins for all buildings.
@@ -640,6 +873,7 @@ class DeliveryPinFinder:
             include_back: Include back garden pins
             min_score: Minimum score threshold
             show_progress: Show tqdm progress bar
+            include_no_garden: Include "no_garden" entries for buildings without suitable garden
             
         Returns:
             List of DeliveryPin objects
@@ -656,15 +890,44 @@ class DeliveryPinFinder:
             iterator = tqdm(iterator, desc="Finding pins", unit="bld")
         
         for idx in iterator:
+            building = self.buildings.iloc[idx]
+            building_id = None
+            if "osm_id" in building.index:
+                building_id = str(building["osm_id"])
+            elif hasattr(building, 'name') and building.name is not None:
+                building_id = str(building.name)
+            else:
+                building_id = f"bld_{idx}"
+            
             if include_front:
                 front_pin = self.find_best_pin_for_building(idx, "front")
                 if front_pin and front_pin.score >= min_score:
                     pins.append(front_pin)
+                elif include_no_garden:
+                    lat, lon = self._get_building_centroid_geo(idx)
+                    pins.append(DeliveryPin(
+                        lat=lat, lon=lon,
+                        garden_type="front", score=0.0,
+                        surface_type="no_garden",
+                        distance_to_building_m=0.0,
+                        building_id=building_id,
+                        metadata={"pixel_x": 0, "pixel_y": 0}
+                    ))
             
             if include_back:
                 back_pin = self.find_best_pin_for_building(idx, "back")
                 if back_pin and back_pin.score >= min_score:
                     pins.append(back_pin)
+                elif include_no_garden:
+                    lat, lon = self._get_building_centroid_geo(idx)
+                    pins.append(DeliveryPin(
+                        lat=lat, lon=lon,
+                        garden_type="back", score=0.0,
+                        surface_type="no_garden",
+                        distance_to_building_m=0.0,
+                        building_id=building_id,
+                        metadata={"pixel_x": 0, "pixel_y": 0}
+                    ))
         
         return pins
     

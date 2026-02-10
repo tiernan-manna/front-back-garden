@@ -31,9 +31,9 @@ from src.tiles import TileSource, fetch_area_image
 from src.osm import (
     fetch_all_osm_data, geometry_to_pixel_coords, project_to_meters, 
     OSM_CACHE_DIR, get_osm_cache_key, fetch_buildings, fetch_roads, fetch_driveways,
-    fetch_address_polygons
+    fetch_address_polygons, fetch_property_boundaries
 )
-from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask
+from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
 from src.classifier import GardenClassifier
 from src.delivery_pins import DeliveryPinFinder, SurfaceType
 
@@ -277,12 +277,12 @@ class FastGardenClassifier:
         if image is None:
             raise ValueError("Failed to fetch imagery")
         
-        # Fetch ONLY essential OSM data (buildings, roads, driveways)
-        # Skip slow queries: exclusion_zones, property_boundaries, address_polygons
+        # Fetch essential OSM data (buildings, roads, driveways, boundaries)
         osm_data = self._fetch_essential_osm(lat, lon, self.POINT_QUERY_RADIUS)
         buildings = osm_data["buildings"]
         roads = osm_data["roads"]
         driveways = osm_data.get("driveways", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+        property_boundaries = osm_data.get("property_boundaries", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
         
         if buildings.empty:
             return {
@@ -317,6 +317,15 @@ class FastGardenClassifier:
         vegetation_mask = exclude_buildings_from_mask(vegetation_mask, building_polys_px)
         vegetation_mask = exclude_roads_from_mask(vegetation_mask, road_lines_px, road_width_px=8)
         
+        # Texture analysis: split vegetation into grass vs tree canopy
+        # Uses CV (std/mean) + building proximity recovery
+        mpp = (geo_bounds["east"] - geo_bounds["west"]) * 111320 * np.cos(np.radians(lat)) / image_size[0]
+        grass_mask, tree_mask = split_vegetation_by_texture(
+            image, vegetation_mask,
+            building_polys_px=building_polys_px,
+            meters_per_pixel=mpp
+        )
+        
         # Classify gardens - include address data for accurate front/back detection
         address_polygons = osm_data.get("address_polygons", None)
         
@@ -333,20 +342,48 @@ class FastGardenClassifier:
             address_polygons=address_polygons  # Include for accurate front/back
         )
         
-        # Use fast classification (skip region-based for speed)
-        classification_mask = classifier.classify_mask_fast(vegetation_mask, show_progress=False)
+        # Create SPATIAL classification mask covering ALL potential garden areas
+        # (not just grass) so paved gardens are also classified as front/back
+        from scipy.ndimage import distance_transform_edt as edt_spatial
+        import cv2 as cv2_spatial
+
+        height_px, width_px = image_size[1], image_size[0]
+        bld_mask_spatial = np.zeros((height_px, width_px), dtype=np.uint8)
+        for poly in building_polys_px:
+            if len(poly) >= 3:
+                pts = np.array(poly, dtype=np.int32)
+                cv2_spatial.fillPoly(bld_mask_spatial, [pts], 255)
+
+        road_mask_spatial = np.zeros((height_px, width_px), dtype=np.uint8)
+        for rline in road_lines_px:
+            if len(rline) >= 2:
+                pts = np.array(rline, dtype=np.int32)
+                cv2_spatial.polylines(road_mask_spatial, [pts], False, 255, thickness=8)
+
+        dist_to_bld_spatial = edt_spatial(bld_mask_spatial == 0) * mpp
+        spatial_mask = np.zeros((height_px, width_px), dtype=np.uint8)
+        spatial_mask[
+            (dist_to_bld_spatial < 20) &
+            (bld_mask_spatial == 0) &
+            (road_mask_spatial == 0)
+        ] = 255
+        del bld_mask_spatial, road_mask_spatial, dist_to_bld_spatial
+
+        classification_mask = classifier.classify_mask_fast(spatial_mask, show_progress=False)
+        del spatial_mask
         
         # Find delivery pins
         pin_finder = DeliveryPinFinder(
             classification_mask=classification_mask,
-            vegetation_mask=vegetation_mask,
+            vegetation_mask=grass_mask,  # Only grass, not trees
             buildings=buildings,
             roads=roads,
             driveways=driveways,
             geo_bounds=geo_bounds,
             image_size=image_size,
             center_lat=lat,
-            center_lon=lon
+            center_lon=lon,
+            property_boundaries=property_boundaries,
         )
         
         # Get pins for nearest building
@@ -368,11 +405,11 @@ class FastGardenClassifier:
         """
         Fetch essential OSM data for point queries.
         
-        Includes address_polygons (critical for accurate front/back detection).
+        Includes address_polygons (critical for accurate front/back detection)
+        and property_boundaries (critical for preventing cross-property pins).
         
         Skips slow queries:
         - exclusion_zones (parks, pitches) - takes 1-6 minutes
-        - property_boundaries (walls, fences) - takes 1-2 minutes
         """
         # Check if we have cached essential data
         cache_key = get_osm_cache_key(lat, lon, radius_m)
@@ -396,11 +433,18 @@ class FastGardenClassifier:
         except Exception:
             address_polygons = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
         
+        # Property boundaries (fences/walls/hedges) prevent cross-property pins
+        try:
+            property_boundaries = fetch_property_boundaries(lat, lon, radius_m, show_progress=False)
+        except Exception:
+            property_boundaries = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        
         data = {
             "buildings": buildings,
             "roads": roads,
             "driveways": driveways,
-            "address_polygons": address_polygons
+            "address_polygons": address_polygons,
+            "property_boundaries": property_boundaries,
         }
         
         # Cache for reuse

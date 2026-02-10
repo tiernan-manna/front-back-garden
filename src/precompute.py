@@ -39,9 +39,10 @@ from src.osm import (
     fetch_roads,
     fetch_driveways,
     fetch_address_polygons,
+    fetch_property_boundaries,
     geometry_to_pixel_coords,
 )
-from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask
+from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
 from src.classifier import GardenClassifier
 from src.delivery_pins import DeliveryPinFinder, DeliveryPin
 
@@ -223,8 +224,13 @@ class PrecomputeManager:
         except Exception:
             address_polygons = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
+        try:
+            property_boundaries = fetch_property_boundaries(center_lat, center_lon, radius_m, show_progress=False)
+        except Exception:
+            property_boundaries = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
         if show_progress:
-            print(f"    {len(buildings)} buildings, {len(roads)} roads ({time.time()-t0:.1f}s)")
+            print(f"    {len(buildings)} buildings, {len(roads)} roads, {len(property_boundaries)} boundaries ({time.time()-t0:.1f}s)")
 
         if buildings.empty:
             return {
@@ -261,6 +267,15 @@ class PrecomputeManager:
         vegetation_mask = exclude_buildings_from_mask(vegetation_mask, building_polys_px)
         vegetation_mask = exclude_roads_from_mask(vegetation_mask, road_lines_px, road_width_px=8)
 
+        # Texture analysis: split vegetation into grass (smooth) vs tree canopy (rough)
+        # Uses CV (std/mean) + building proximity recovery for robustness
+        mpp = (geo_bounds["east"] - geo_bounds["west"]) * 111320 * np.cos(np.radians(center_lat)) / image_size[0]
+        grass_mask, tree_mask = split_vegetation_by_texture(
+            image, vegetation_mask,
+            building_polys_px=building_polys_px,
+            meters_per_pixel=mpp
+        )
+
         if show_progress:
             print(f"    Vegetation detected ({time.time()-t0:.1f}s)")
 
@@ -282,7 +297,36 @@ class PrecomputeManager:
             address_polygons=address_polygons,
         )
 
-        classification_mask = classifier.classify_mask_fast(vegetation_mask, show_progress=False)
+        # Create SPATIAL classification mask covering ALL potential garden areas
+        # (not just grass). This ensures paved/concrete front gardens are also
+        # classified as front/back, so the pin finder can place pins there.
+        from scipy.ndimage import distance_transform_edt as edt_spatial
+        import cv2 as cv2_spatial
+
+        height_px, width_px = image_size[1], image_size[0]
+        bld_mask_spatial = np.zeros((height_px, width_px), dtype=np.uint8)
+        for poly in building_polys_px:
+            if len(poly) >= 3:
+                pts = np.array(poly, dtype=np.int32)
+                cv2_spatial.fillPoly(bld_mask_spatial, [pts], 255)
+
+        road_mask_spatial = np.zeros((height_px, width_px), dtype=np.uint8)
+        for rline in road_lines_px:
+            if len(rline) >= 2:
+                pts = np.array(rline, dtype=np.int32)
+                cv2_spatial.polylines(road_mask_spatial, [pts], False, 255, thickness=8)
+
+        dist_to_bld_spatial = edt_spatial(bld_mask_spatial == 0) * mpp
+        spatial_mask = np.zeros((height_px, width_px), dtype=np.uint8)
+        spatial_mask[
+            (dist_to_bld_spatial < 20) &
+            (bld_mask_spatial == 0) &
+            (road_mask_spatial == 0)
+        ] = 255
+        del bld_mask_spatial, road_mask_spatial, dist_to_bld_spatial
+
+        classification_mask = classifier.classify_mask_fast(spatial_mask, show_progress=False)
+        del spatial_mask
 
         if show_progress:
             print(f"    Classification complete ({time.time()-t0:.1f}s)")
@@ -294,7 +338,7 @@ class PrecomputeManager:
 
         pin_finder = DeliveryPinFinder(
             classification_mask=classification_mask,
-            vegetation_mask=vegetation_mask,
+            vegetation_mask=grass_mask,  # Only grass, not trees
             buildings=buildings,
             roads=roads,
             driveways=driveways,
@@ -303,6 +347,7 @@ class PrecomputeManager:
             center_lat=center_lat,
             center_lon=center_lon,
             building_directions=getattr(classifier, 'building_directions', None),
+            property_boundaries=property_boundaries,
         )
 
         all_pins: List[DeliveryPin] = []
@@ -326,21 +371,63 @@ class PrecomputeManager:
 
             # Find ONE front pin and ONE back pin for this building
             front_pin = pin_finder.find_best_pin_for_building(idx, "front")
-            if front_pin and front_pin.score >= 15:
+            if front_pin:
                 front_pin.building_id = building_id
                 all_pins.append(front_pin)
+            else:
+                # No suitable front garden - place pin at EXPECTED garden location
+                # (offset from building toward road, not at building centroid)
+                centroid = building.geometry.centroid
+                expected_lat, expected_lon = centroid.y, centroid.x
+                bld_idx_original = buildings.index[idx]
+                direction_info = classifier.building_directions.get(bld_idx_original)
+                if direction_info:
+                    road_dir = direction_info.get("direction_to_road")
+                    if road_dir is not None and np.linalg.norm(road_dir) > 0.1:
+                        offset_m = 5.0
+                        expected_lat += road_dir[1] * offset_m / 111320
+                        expected_lon += road_dir[0] * offset_m / (111320 * np.cos(np.radians(center_lat)))
+                all_pins.append(DeliveryPin(
+                    lat=expected_lat, lon=expected_lon,
+                    garden_type="front", score=0.0,
+                    surface_type="no_garden",
+                    distance_to_building_m=0.0,
+                    building_id=building_id,
+                    metadata={}
+                ))
 
             back_pin = pin_finder.find_best_pin_for_building(idx, "back")
-            if back_pin and back_pin.score >= 15:
+            if back_pin:
                 back_pin.building_id = building_id
                 all_pins.append(back_pin)
+            else:
+                # No suitable back garden - place pin at EXPECTED location (opposite road)
+                centroid = building.geometry.centroid
+                expected_lat, expected_lon = centroid.y, centroid.x
+                bld_idx_original = buildings.index[idx]
+                direction_info = classifier.building_directions.get(bld_idx_original)
+                if direction_info:
+                    road_dir = direction_info.get("direction_to_road")
+                    if road_dir is not None and np.linalg.norm(road_dir) > 0.1:
+                        offset_m = 5.0
+                        expected_lat -= road_dir[1] * offset_m / 111320
+                        expected_lon -= road_dir[0] * offset_m / (111320 * np.cos(np.radians(center_lat)))
+                all_pins.append(DeliveryPin(
+                    lat=expected_lat, lon=expected_lon,
+                    garden_type="back", score=0.0,
+                    surface_type="no_garden",
+                    distance_to_building_m=0.0,
+                    building_id=building_id,
+                    metadata={}
+                ))
 
         if show_progress:
             print(f"    Found {len(all_pins)} pins ({time.time()-t0:.1f}s)")
 
         # ---- Cache results ----
-        num_front = sum(1 for p in all_pins if p.garden_type == "front")
-        num_back = sum(1 for p in all_pins if p.garden_type == "back")
+        num_front = sum(1 for p in all_pins if p.garden_type == "front" and p.score > 0)
+        num_back = sum(1 for p in all_pins if p.garden_type == "back" and p.score > 0)
+        num_no_garden = sum(1 for p in all_pins if p.score == 0)
 
         precomputed = PrecomputedArea(
             center_lat=center_lat,
@@ -380,6 +467,7 @@ class PrecomputeManager:
             print(f"   Buildings: {len(buildings)}")
             print(f"   Front pins: {num_front}")
             print(f"   Back pins: {num_back}")
+            print(f"   No garden: {num_no_garden}")
             print(f"   Total time: {elapsed:.1f}s")
 
         return {
@@ -390,6 +478,7 @@ class PrecomputeManager:
             "total_buildings": len(buildings),
             "num_front": num_front,
             "num_back": num_back,
+            "num_no_garden": num_no_garden,
             "elapsed_seconds": round(elapsed, 2),
             "tile_source": self.tile_source.value if hasattr(self.tile_source, 'value') else str(self.tile_source),
             "from_cache": False,

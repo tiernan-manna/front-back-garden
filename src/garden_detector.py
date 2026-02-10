@@ -127,6 +127,120 @@ def detect_green_areas(
     return clean_mask, filtered_contours
 
 
+def split_vegetation_by_texture(
+    image: np.ndarray,
+    vegetation_mask: np.ndarray,
+    building_polys_px: List[List[tuple]] = None,
+    texture_window: int = 11,
+    meters_per_pixel: float = 0.3
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split vegetation into grass (smooth) and tree canopy (rough) using texture analysis.
+    
+    Uses TWO features for robust discrimination:
+    1. Coefficient of variation (std/mean) - normalizes texture for brightness.
+       Trees have high CV (bright canopy + dark shadow = high variance relative to mean).
+       Grass has low CV (uniform surface = low variance relative to mean).
+       This is more robust than raw std alone because it handles shadowed grass correctly.
+    2. Building-proximity recovery - vegetation near buildings that was classified as tree
+       gets a second chance, since building shadows increase texture of nearby grass.
+    
+    Args:
+        image: RGB image as numpy array (H, W, 3)
+        vegetation_mask: Binary mask where >0 = vegetation (after building/road exclusion)
+        building_polys_px: List of building polygons in pixel coords (for proximity recovery)
+        texture_window: Window size for local stats (odd number, ~3.3m at zoom 19)
+        meters_per_pixel: Scale for building proximity recovery distance
+            
+    Returns:
+        Tuple of (grass_mask, tree_mask) - both binary uint8 masks (0 or 255)
+    """
+    from scipy.ndimage import uniform_filter, distance_transform_edt
+    
+    # Use luminance (grayscale) for texture - captures shadow/highlight patterns
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float64)
+    
+    # Compute local mean and standard deviation
+    local_mean = uniform_filter(gray, size=texture_window)
+    local_sq_mean = uniform_filter(gray ** 2, size=texture_window)
+    local_variance = np.maximum(local_sq_mean - local_mean ** 2, 0)
+    local_std = np.sqrt(local_variance)
+    
+    # Coefficient of variation: std / mean
+    # This normalizes texture for brightness differences, making it robust to:
+    # - Building shadows on grass (dark but still smooth → low CV)
+    # - Bright tree canopy tops (bright but still rough → high CV)
+    cv = local_std / np.maximum(local_mean, 1.0)
+    
+    veg_pixels = vegetation_mask > 0
+    
+    if np.sum(veg_pixels) > 100:
+        # Adaptive threshold on CV values within vegetation
+        veg_cv = cv[veg_pixels]
+        cv_threshold = np.percentile(veg_cv, 40)
+        cv_threshold = float(np.clip(cv_threshold, 0.05, 0.5))
+    else:
+        cv_threshold = 0.15
+    
+    # Primary split using CV
+    grass_pixels = veg_pixels & (cv < cv_threshold)
+    tree_pixels = veg_pixels & (cv >= cv_threshold)
+    
+    # Building-proximity recovery: vegetation within 5m of a building edge that
+    # was classified as "tree" may actually be garden affected by building shadow.
+    # Recovery condition: near a building AND not extremely rough (CV < 1.5x threshold)
+    recovered_count = 0
+    if building_polys_px is not None and len(building_polys_px) > 0:
+        # Create building mask
+        h, w = vegetation_mask.shape
+        bld_mask = np.zeros((h, w), dtype=np.uint8)
+        for poly_coords in building_polys_px:
+            if len(poly_coords) >= 3:
+                pts = np.array(poly_coords, dtype=np.int32)
+                cv2.fillPoly(bld_mask, [pts], 255)
+        
+        # Distance to nearest building edge
+        bld_dist = distance_transform_edt(bld_mask == 0) * meters_per_pixel
+        near_building = bld_dist < 8.0
+        
+        # Recover: classified as tree, near building, CV not extreme
+        # Generous recovery (2.0x threshold) because building shadows increase
+        # texture of nearby grass, making it look like tree canopy
+        recoverable = tree_pixels & near_building & (cv < cv_threshold * 2.0)
+        recovered_count = int(np.sum(recoverable))
+        
+        grass_pixels = grass_pixels | recoverable
+        tree_pixels = tree_pixels & ~recoverable
+    
+    grass_mask = np.zeros_like(vegetation_mask)
+    tree_mask = np.zeros_like(vegetation_mask)
+    grass_mask[grass_pixels] = 255
+    tree_mask[tree_pixels] = 255
+    
+    # Morphological cleanup: close tiny gaps in grass patches
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    grass_mask = cv2.morphologyEx(grass_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    tree_mask = cv2.morphologyEx(tree_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    
+    # Resolve overlap (prefer grass)
+    overlap = (grass_mask > 0) & (tree_mask > 0)
+    tree_mask[overlap] = 0
+    
+    # Stay within original vegetation boundary
+    grass_mask[~veg_pixels] = 0
+    tree_mask[~veg_pixels] = 0
+    
+    grass_count = int(np.sum(grass_mask > 0))
+    tree_count = int(np.sum(tree_mask > 0))
+    total_veg = int(np.sum(veg_pixels))
+    print(f"    Texture split (CV threshold={cv_threshold:.3f}): "
+          f"{grass_count:,} grass ({100*grass_count/max(total_veg,1):.0f}%), "
+          f"{tree_count:,} tree ({100*tree_count/max(total_veg,1):.0f}%), "
+          f"{recovered_count:,} recovered near buildings")
+    
+    return grass_mask, tree_mask
+
+
 def fill_holes(mask: np.ndarray) -> np.ndarray:
     """
     Fill holes within regions of a binary mask.

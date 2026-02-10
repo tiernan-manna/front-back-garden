@@ -102,7 +102,7 @@ class BatchPinRequest(BaseModel):
     lon: float = Field(..., ge=-180, le=180, description="Center longitude")
     radius_m: float = Field(500, ge=10, le=5000, description="Search radius in meters")
     garden_type: Optional[str] = Field(None, description="Filter by 'front' or 'back'")
-    min_score: float = Field(20.0, ge=0, le=100, description="Minimum score threshold")
+    min_score: float = Field(0.0, ge=0, le=100, description="Minimum score threshold (0 to include no-garden entries)")
     tile_source: TileSourceEnum = Field(TileSourceEnum.auto, description="Tile source to use")
     generate_map: bool = Field(False, description="Generate visualization map")
 
@@ -365,46 +365,115 @@ def generate_pins_map(
             except Exception:
                 continue
         
-        # Draw pins
+        # Score-to-color gradient (BGR)
+        def score_to_color(score, garden_type):
+            """Map score to BGR color. Uses green tones for front, blue tones for back."""
+            if score <= 0:
+                return (128, 128, 128)  # Gray for no garden
+            
+            if garden_type == "front":
+                if score < 40:
+                    return (0, 0, 200)      # Red (poor)
+                elif score < 60:
+                    return (0, 128, 255)    # Orange
+                elif score < 75:
+                    return (0, 200, 200)    # Yellow-green
+                elif score < 90:
+                    return (0, 220, 100)    # Lime
+                else:
+                    return (0, 255, 0)      # Bright green (excellent)
+            else:  # back
+                if score < 40:
+                    return (100, 0, 200)    # Red-purple (poor)
+                elif score < 60:
+                    return (200, 80, 80)    # Muted blue
+                elif score < 75:
+                    return (220, 160, 0)    # Teal
+                elif score < 90:
+                    return (230, 180, 0)    # Light blue
+                else:
+                    return (255, 100, 0)    # Bright blue (excellent)
+        
+        # Draw pins with score-based colors
         for pin in pins:
             lat = pin["lat"]
             lon = pin["lon"]
             garden_type = pin.get("garden_type", "unknown")
             score = pin.get("score", 0)
+            surface_type = pin.get("surface_type", "unknown")
             
             # Convert to pixel coordinates
             px = int((lon - geo_bounds["west"]) / (geo_bounds["east"] - geo_bounds["west"]) * width)
             py = int((geo_bounds["north"] - lat) / (geo_bounds["north"] - geo_bounds["south"]) * height)
             
-            # Color based on garden type
-            if garden_type == "front":
-                color = (0, 255, 0)  # Green for front
-            elif garden_type == "back":
-                color = (255, 0, 0)  # Blue for back (BGR)
+            color = score_to_color(score, garden_type)
+            
+            if surface_type == "no_garden":
+                # Draw distinctive marker at expected garden position
+                # Orange X for front, purple X for back - easy to verify
+                ng_color = (0, 165, 255) if garden_type == "front" else (200, 100, 200)
+                size = 5
+                cv2.line(map_image, (px-size, py-size), (px+size, py+size), ng_color, 2)
+                cv2.line(map_image, (px-size, py+size), (px+size, py-size), ng_color, 2)
+                # Label with "N" for no-garden
+                cv2.putText(map_image, "N", (px + size + 2, py + 4),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, ng_color, 1)
             else:
-                color = (0, 255, 255)  # Yellow for unknown
-            
-            # Size based on score
-            radius = max(5, int(score / 10))
-            
-            # Draw pin marker
-            cv2.circle(map_image, (px, py), radius, color, -1)
-            cv2.circle(map_image, (px, py), radius + 2, (255, 255, 255), 2)
-            
-            # Add score label
-            label = f"{int(score)}"
-            cv2.putText(map_image, label, (px + radius + 3, py + 4), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                # Size based on score (bigger = better)
+                radius = max(4, int(score / 15))
+                
+                # Draw pin marker with score-based color
+                cv2.circle(map_image, (px, py), radius, color, -1)
+                cv2.circle(map_image, (px, py), radius + 1, (255, 255, 255), 1)
+                
+                # Surface type indicator + score label
+                surface_prefix = {"grass": "G", "driveway": "D", "paved": "P", "tree": "T"}.get(surface_type, "?")
+                label = f"{surface_prefix}{int(score)}"
+                cv2.putText(map_image, label, (px + radius + 2, py + 4),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
         
-        # Add legend
-        legend_y = 30
-        cv2.rectangle(map_image, (10, 10), (180, 90), (0, 0, 0), -1)
-        cv2.rectangle(map_image, (10, 10), (180, 90), (255, 255, 255), 1)
-        cv2.circle(map_image, (25, legend_y), 8, (0, 255, 0), -1)
-        cv2.putText(map_image, "Front Garden", (40, legend_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.circle(map_image, (25, legend_y + 25), 8, (255, 0, 0), -1)
-        cv2.putText(map_image, "Back Garden", (40, legend_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(map_image, f"Pins: {len(pins)}", (20, legend_y + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Add legend with score ranges and surface types
+        num_no_garden = sum(1 for p in pins if p.get("surface_type") == "no_garden")
+        num_grass = sum(1 for p in pins if p.get("surface_type") == "grass")
+        num_paved = sum(1 for p in pins if p.get("surface_type") in ("paved", "driveway"))
+        num_with_garden = len(pins) - num_no_garden
+        
+        legend_h = 220
+        cv2.rectangle(map_image, (10, 10), (260, 10 + legend_h), (0, 0, 0), -1)
+        cv2.rectangle(map_image, (10, 10), (260, 10 + legend_h), (255, 255, 255), 1)
+        
+        y = 30
+        cv2.putText(map_image, "Pin Labels: G=Grass D=Drive P=Paved", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 18
+        cv2.putText(map_image, "Score Colors (front=green, back=blue):", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 18
+        cv2.circle(map_image, (25, y), 5, (0, 255, 0), -1)
+        cv2.putText(map_image, "90-100 (excellent grass)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 16
+        cv2.circle(map_image, (25, y), 5, (0, 220, 100), -1)
+        cv2.putText(map_image, "75-89 (good garden)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 16
+        cv2.circle(map_image, (25, y), 5, (0, 200, 200), -1)
+        cv2.putText(map_image, "60-74 (decent/driveway)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 16
+        cv2.circle(map_image, (25, y), 5, (0, 128, 255), -1)
+        cv2.putText(map_image, "40-59 (paved area)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 16
+        cv2.circle(map_image, (25, y), 5, (0, 0, 200), -1)
+        cv2.putText(map_image, "1-39 (poor)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
+        y += 18
+        # No-garden markers
+        sz = 4
+        cv2.line(map_image, (22, y-2), (28, y+4), (0, 165, 255), 2)
+        cv2.line(map_image, (22, y+4), (28, y-2), (0, 165, 255), 2)
+        cv2.putText(map_image, "No front garden (expected pos)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
+        y += 16
+        cv2.line(map_image, (22, y-2), (28, y+4), (200, 100, 200), 2)
+        cv2.line(map_image, (22, y+4), (28, y-2), (200, 100, 200), 2)
+        cv2.putText(map_image, "No back garden (expected pos)", (40, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 100, 200), 1)
+        y += 20
+        cv2.putText(map_image, f"Grass: {num_grass} | Paved: {num_paved} | None: {num_no_garden}", (20, y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.33, (255, 255, 255), 1)
         
         # Save the map
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
