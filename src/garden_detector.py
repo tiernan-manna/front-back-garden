@@ -176,8 +176,10 @@ def split_vegetation_by_texture(
     
     if np.sum(veg_pixels) > 100:
         # Adaptive threshold on CV values within vegetation
+        # 50th percentile = median: half of vegetation is "smooth" (grass),
+        # half is "rough" (tree canopy). This is a good balance for Irish suburbs.
         veg_cv = cv[veg_pixels]
-        cv_threshold = np.percentile(veg_cv, 40)
+        cv_threshold = np.percentile(veg_cv, 50)
         cv_threshold = float(np.clip(cv_threshold, 0.05, 0.5))
     else:
         cv_threshold = 0.15

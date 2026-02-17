@@ -19,6 +19,7 @@ import numpy as np
 import geopandas as gpd
 from scipy.spatial import cKDTree
 from scipy.ndimage import distance_transform_edt
+from shapely import STRtree
 from shapely.geometry import Point, Polygon, LineString
 from shapely.ops import nearest_points
 from typing import Tuple, List, Dict, Optional
@@ -84,8 +85,10 @@ class GardenClassifier:
         # Handle driveways
         if driveways is not None and not driveways.empty:
             self.driveways_m = project_to_meters(driveways, center_lat, center_lon)
+            self.driveways_wgs = driveways
         else:
             self.driveways_m = gpd.GeoDataFrame(geometry=[], crs=self.buildings_m.crs)
+            self.driveways_wgs = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
         
         # Handle exclusion zones
         if exclusion_zones is not None and not exclusion_zones.empty:
@@ -135,13 +138,15 @@ class GardenClassifier:
         if self.buildings_m.empty or self.roads_m.empty:
             return
         
-        # Merge all roads into a single geometry for distance calculations
-        all_roads = self.roads_m.geometry.unary_union
+        # Build STRtree spatial indexes for O(log n) nearest-neighbor lookups.
+        # This replaces the old unary_union approach which was O(n) per query.
+        road_geoms = list(self.roads_m.geometry)
+        road_tree = STRtree(road_geoms)
         
-        # Also merge driveways if available
         has_driveways = not self.driveways_m.empty
         if has_driveways:
-            all_driveways = self.driveways_m.geometry.unary_union
+            driveway_geoms = list(self.driveways_m.geometry)
+            driveway_tree = STRtree(driveway_geoms)
         
         # Build a lookup from street name to road geometry
         has_addresses = not self.address_polygons_wgs.empty and "addr:street" in self.address_polygons_wgs.columns
@@ -199,63 +204,68 @@ class GardenClassifier:
             try:
                 direction = None
                 source = "road"
+                road_distance = None
                 
                 # Priority 1: Use address street name to find the correct road
+                # Uses spatial index to find nearby addresses in O(log n)
                 if has_addresses and street_roads:
                     try:
-                        # Check if there's an address polygon that matches this building
-                        for addr_idx, addr in self.address_polygons_m.iterrows():
-                            if building.geometry.intersects(addr.geometry) or building.geometry.distance(addr.geometry) < 5:
-                                if addr_idx in self.address_polygons_wgs.index:
-                                    addr_wgs = self.address_polygons_wgs.loc[addr_idx]
+                        nearby = list(self.address_polygons_m.sindex.query(
+                            building.geometry.buffer(5), predicate=None
+                        ))
+                        for addr_pos in nearby:
+                            addr = self.address_polygons_m.iloc[addr_pos]
+                            addr_idx = self.address_polygons_m.index[addr_pos]
+                            
+                            if addr_idx in self.address_polygons_wgs.index:
+                                addr_wgs = self.address_polygons_wgs.loc[addr_idx]
+                                
+                                street_name = None
+                                if "addr:street" in addr_wgs.index:
+                                    street_name = addr_wgs["addr:street"]
+                                
+                                if street_name and isinstance(street_name, str):
+                                    street_name_lower = street_name.strip().lower()
                                     
-                                    # Safely get street name
-                                    street_name = None
-                                    if "addr:street" in addr_wgs.index:
-                                        street_name = addr_wgs["addr:street"]
-                                    
-                                    if street_name and isinstance(street_name, str):
-                                        # Normalize for matching
-                                        street_name_lower = street_name.strip().lower()
+                                    if street_name_lower in street_roads:
+                                        street_geoms = street_roads[street_name_lower]
+                                        min_dist = float("inf")
+                                        best_point = None
                                         
-                                        if street_name_lower in street_roads:
-                                            # Find direction to the named street
-                                            street_geoms = street_roads[street_name_lower]
-                                            min_dist = float("inf")
-                                            best_point = None
+                                        for geom in street_geoms:
+                                            try:
+                                                point = nearest_points(centroid, geom)[1]
+                                                dist = centroid.distance(point)
+                                                if dist < min_dist:
+                                                    min_dist = dist
+                                                    best_point = point
+                                            except Exception:
+                                                pass
+                                        
+                                        if best_point is not None and min_dist < 150:
+                                            dx = best_point.x - centroid.x
+                                            dy = best_point.y - centroid.y
+                                            length = np.sqrt(dx**2 + dy**2)
                                             
-                                            for geom in street_geoms:
-                                                try:
-                                                    point = nearest_points(centroid, geom)[1]
-                                                    dist = centroid.distance(point)
-                                                    if dist < min_dist:
-                                                        min_dist = dist
-                                                        best_point = point
-                                                except Exception:
-                                                    pass
-                                            
-                                            if best_point is not None and min_dist < 150:  # Increased distance
-                                                dx = best_point.x - centroid.x
-                                                dy = best_point.y - centroid.y
-                                                length = np.sqrt(dx**2 + dy**2)
-                                                
-                                                if length > 0.1:
-                                                    direction = np.array([dx / length, dy / length])
-                                                    source = "address"
-                                                    address_count += 1
+                                            if length > 0.1:
+                                                direction = np.array([dx / length, dy / length])
+                                                source = "address"
+                                                address_count += 1
                                 break
-                    except Exception as e:
+                    except Exception:
                         pass
                 
-                # Priority 2: Try to find a driveway near this building
+                # Priority 2: Driveway nearest (STRtree O(log n) lookup)
                 if direction is None and has_driveways:
                     try:
-                        nearest_driveway_point = nearest_points(centroid, all_driveways)[1]
-                        driveway_dist = centroid.distance(nearest_driveway_point)
+                        nearest_idx = driveway_tree.nearest(centroid)
+                        nearest_dw = driveway_geoms[nearest_idx]
+                        nearest_dw_point = nearest_points(centroid, nearest_dw)[1]
+                        driveway_dist = centroid.distance(nearest_dw_point)
                         
                         if driveway_dist < 30:
-                            dx = nearest_driveway_point.x - centroid.x
-                            dy = nearest_driveway_point.y - centroid.y
+                            dx = nearest_dw_point.x - centroid.x
+                            dy = nearest_dw_point.y - centroid.y
                             length = np.sqrt(dx**2 + dy**2)
                             
                             if length > 0.1:
@@ -265,9 +275,11 @@ class GardenClassifier:
                     except Exception:
                         pass
                 
-                # Priority 3: Fall back to nearest road
+                # Priority 3: Nearest road (STRtree O(log n) lookup)
                 if direction is None:
-                    nearest_road_point = nearest_points(centroid, all_roads)[1]
+                    nearest_idx = road_tree.nearest(centroid)
+                    nearest_road = road_geoms[nearest_idx]
+                    nearest_road_point = nearest_points(centroid, nearest_road)[1]
                     
                     dx = nearest_road_point.x - centroid.x
                     dy = nearest_road_point.y - centroid.y
@@ -278,15 +290,18 @@ class GardenClassifier:
                         road_count += 1
                     else:
                         direction = np.array([0, 0])
+                    
+                    road_distance = centroid.distance(nearest_road_point)
                 
-                # Compute distance to nearest road for reference
-                nearest_road_point = nearest_points(centroid, all_roads)[1]
-                distance = centroid.distance(nearest_road_point)
+                # Compute road distance if not already known (address/driveway path)
+                if road_distance is None:
+                    nearest_idx = road_tree.nearest(centroid)
+                    road_distance = centroid.distance(road_geoms[nearest_idx])
                 
                 self.building_directions[idx] = {
                     "centroid": centroid,
                     "direction_to_road": direction,
-                    "distance_to_road": distance,
+                    "distance_to_road": road_distance,
                     "source": source,
                 }
                 
@@ -294,6 +309,105 @@ class GardenClassifier:
                 warnings.warn(f"Could not compute direction for building {idx}: {e}")
         
         print(f"    Front direction: {address_count} from address, {driveway_count} from driveways, {road_count} from roads")
+        
+        # ---- CONSENSUS CORRECTION ----
+        # Buildings that used "nearest road" fallback may face the wrong way
+        # (e.g., closer to a road behind the house). Use nearby buildings with
+        # reliable directions (address/driveway-matched) to correct them.
+        reliable_idxs = []
+        reliable_centroids = []
+        reliable_dirs = []
+        unreliable_idxs = []
+        unreliable_centroids = []
+        
+        for b_idx, info in self.building_directions.items():
+            c = info["centroid"]
+            if info["source"] in ("address", "driveway"):
+                reliable_idxs.append(b_idx)
+                reliable_centroids.append([c.x, c.y])
+                reliable_dirs.append(info["direction_to_road"])
+            elif info["source"] == "road":
+                unreliable_idxs.append(b_idx)
+                unreliable_centroids.append([c.x, c.y])
+        
+        if len(reliable_centroids) >= 3 and unreliable_centroids:
+            reliable_arr = np.array(reliable_centroids)
+            reliable_dirs_arr = np.array(reliable_dirs)
+            reliable_tree = cKDTree(reliable_arr)
+            
+            corrected = 0
+            for i, b_idx in enumerate(unreliable_idxs):
+                pt = np.array([unreliable_centroids[i]])
+                k = min(7, len(reliable_centroids))
+                dists, indices = reliable_tree.query(pt, k=k)
+                dists = dists[0] if k > 1 else [dists[0]]
+                indices = indices[0] if k > 1 else [indices[0]]
+                
+                # Gather directions from reliable neighbors within 60m
+                nearby_dirs = []
+                for j, d in zip(indices, dists):
+                    if d < 60:
+                        nearby_dirs.append(reliable_dirs_arr[j])
+                
+                if len(nearby_dirs) >= 2:
+                    avg_dir = np.mean(nearby_dirs, axis=0)
+                    avg_len = np.linalg.norm(avg_dir)
+                    if avg_len > 0.3:
+                        avg_dir = avg_dir / avg_len
+                        current_dir = self.building_directions[b_idx]["direction_to_road"]
+                        dot = np.dot(current_dir, avg_dir)
+                        if dot < 0.0:
+                            # Facing opposite to neighbors → adopt neighbor consensus
+                            self.building_directions[b_idx]["direction_to_road"] = avg_dir
+                            self.building_directions[b_idx]["source"] = "consensus"
+                            corrected += 1
+            
+            if corrected > 0:
+                print(f"    Consensus correction: {corrected}/{len(unreliable_idxs)} road-fallback directions fixed")
+        
+        # ---- OUTLIER DETECTION for address-matched buildings ----
+        # Even address-matched buildings can face wrong when a street curves around.
+        # Check each building against its closest 5 neighbors; if it's an outlier, fix.
+        if len(self.building_directions) > 10:
+            all_idxs = list(self.building_directions.keys())
+            all_centroids = np.array([[self.building_directions[i]["centroid"].x,
+                                        self.building_directions[i]["centroid"].y] for i in all_idxs])
+            all_dirs = np.array([self.building_directions[i]["direction_to_road"] for i in all_idxs])
+            all_tree = cKDTree(all_centroids)
+            
+            outlier_fixed = 0
+            for i, b_idx in enumerate(all_idxs):
+                k = min(8, len(all_idxs))
+                dists, indices = all_tree.query(all_centroids[i:i+1], k=k)
+                dists = dists[0]
+                indices = indices[0]
+                
+                # Skip self (index 0) and get neighbors within 40m
+                neighbor_dirs = []
+                for j, d in zip(indices[1:], dists[1:]):
+                    if d < 40:
+                        neighbor_dirs.append(all_dirs[j])
+                
+                if len(neighbor_dirs) >= 4:
+                    avg = np.mean(neighbor_dirs, axis=0)
+                    avg_len = np.linalg.norm(avg)
+                    if avg_len > 0.5:  # Strong neighbor consensus
+                        avg = avg / avg_len
+                        my_dir = all_dirs[i]
+                        dot = np.dot(my_dir, avg)
+                        if dot < -0.3:  # Facing opposite to most neighbors
+                            self.building_directions[b_idx]["direction_to_road"] = avg
+                            self.building_directions[b_idx]["source"] += "+outlier_fix"
+                            all_dirs[i] = avg  # Update for subsequent checks
+                            outlier_fixed += 1
+            
+            if outlier_fixed > 0:
+                print(f"    Outlier correction: {outlier_fixed} buildings fixed to match neighbors")
+        
+        # NOTE: Pixel-based road proximity flipping was removed because it corrupted
+        # the classification mask (flipping too many correct directions). Instead,
+        # the pin finder uses direction-agnostic fallback: if no grass is found
+        # in the primary direction, it tries the opposite direction.
     
     def classify_pixel(
         self,
@@ -560,6 +674,35 @@ class GardenClassifier:
         if show_progress:
             pbar.update(1)
             pbar.close()
+        
+        # OVERRIDE: Driveway-adjacent areas are ALWAYS front garden
+        # Driveways are the strongest indicator of "front" - they connect to roads
+        if not self.driveways_wgs.empty:
+            import cv2 as cv2_cls
+            from scipy.ndimage import distance_transform_edt as edt_cls
+            from src.osm import geometry_to_pixel_coords
+            
+            driveway_mask_cls = np.zeros((height, width), dtype=np.uint8)
+            for _, dw in self.driveways_wgs.iterrows():
+                try:
+                    coords = geometry_to_pixel_coords(
+                        dw.geometry, self.geo_bounds, self.image_size
+                    )
+                    if coords and len(coords) >= 2:
+                        pts = np.array(coords, dtype=np.int32)
+                        cv2_cls.polylines(driveway_mask_cls, [pts], False, 255, thickness=10)
+                except Exception:
+                    continue
+            
+            if np.any(driveway_mask_cls > 0):
+                mpp_cls = (self.geo_bounds["east"] - self.geo_bounds["west"]) * 111320 * np.cos(np.radians(self.center_lat)) / width
+                dw_dist = edt_cls(driveway_mask_cls == 0) * mpp_cls
+                # Garden pixels within 5m of a driveway → force FRONT
+                near_driveway = (dw_dist < 5.0) & (result > 0)
+                overridden = int(np.sum(near_driveway & (result == self.BACK_GARDEN)))
+                result[near_driveway] = self.FRONT_GARDEN
+                if show_progress and overridden > 0:
+                    print(f"    Driveway override: {overridden} back→front pixels near driveways")
         
         return result
     

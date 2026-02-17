@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -24,12 +25,40 @@ from tqdm import tqdm
 
 import config
 
+# Allow large images (3000m radius at zoom 19 = ~1.1B pixels).
+# We control the input (our own cached tiles), so the decompression bomb
+# check is not needed and would block legitimate large-area fetches.
+Image.MAX_IMAGE_PIXELS = None
+
 # Cache directory
 CACHE_DIR = Path(config.OUTPUT_DIR) / "cache"
 
 # Global session token cache (for Google)
 _session_token = None
 _session_expiry = None
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown support
+# ---------------------------------------------------------------------------
+# A threading.Event checked inside the tile fetch loop.  When set, the loop
+# stops early so Ctrl+C / POST /api/shutdown actually terminates the process
+# instead of leaving threads spinning on HTTP requests.
+_shutdown_event = threading.Event()
+
+
+def request_shutdown():
+    """Signal all tile-fetching loops to stop."""
+    _shutdown_event.set()
+
+
+def clear_shutdown():
+    """Reset the shutdown flag (call on server start)."""
+    _shutdown_event.clear()
+
+
+def is_shutdown_requested() -> bool:
+    """Check whether a shutdown has been requested."""
+    return _shutdown_event.is_set()
 
 
 class TileSource(Enum):
@@ -388,6 +417,40 @@ def meters_to_tiles(meters: float, lat: float, zoom: int) -> int:
     return max(1, tiles_needed)
 
 
+# Maximum image dimension (width or height) in pixels that we'll attempt to
+# process.  At 33k×33k a single RGB array is 3.4 GB; the full pipeline
+# (HSV, 7 masks, morphology, contours, distance transforms) needs ~15 GB+
+# which causes swap-thrashing on most machines.
+# 10000×10000 ≈ 300 MB RGB → ~2-3 GB peak pipeline → comfortably fits in 8 GB.
+MAX_IMAGE_PIXELS_SIDE = 12_000
+
+
+def recommended_zoom(radius_m: float, lat: float, preferred_zoom: int = None) -> int:
+    """
+    Return the highest zoom level that keeps the stitched image within
+    MAX_IMAGE_PIXELS_SIDE on each side.
+
+    Args:
+        radius_m: Radius in meters
+        lat: Latitude (affects meters-per-pixel)
+        preferred_zoom: Zoom to start from (default: config.ZOOM_LEVEL)
+
+    Returns:
+        Zoom level (may be lower than preferred if image would be too large)
+    """
+    if preferred_zoom is None:
+        preferred_zoom = config.ZOOM_LEVEL
+
+    for z in range(preferred_zoom, 14, -1):
+        tiles_radius = meters_to_tiles(radius_m, lat, z)
+        side_tiles = 2 * tiles_radius + 1
+        side_px = side_tiles * config.TILE_SIZE
+        if side_px <= MAX_IMAGE_PIXELS_SIDE:
+            return z
+
+    return 15  # minimum reasonable zoom
+
+
 def get_tiles_for_radius(
     center_lat: float, 
     center_lon: float, 
@@ -427,6 +490,11 @@ def get_tiles_for_radius(
     return tiles, (min_x, min_y, max_x, max_y)
 
 
+# Counter for tile fetch errors (reset per fetch_area_image call)
+_tile_error_count = 0
+_TILE_ERROR_LOG_LIMIT = 5  # Only log the first N errors to avoid spam
+
+
 def fetch_tile(
     tile_x: int, 
     tile_y: int, 
@@ -447,6 +515,8 @@ def fetch_tile(
     Returns:
         PIL Image or None if fetch failed
     """
+    global _tile_error_count
+
     if not config.GOOGLE_TILES_API_KEY:
         raise ValueError(
             "Google Tiles API key not configured!\n"
@@ -469,8 +539,21 @@ def fetch_tile(
         img = Image.open(BytesIO(response.content))
         return img.convert("RGB")
         
-    except requests.RequestException as e:
-        # Only print first few errors to avoid spam
+    except Exception as e:
+        _tile_error_count += 1
+        if _tile_error_count <= _TILE_ERROR_LOG_LIMIT:
+            # Log HTTP status and body for diagnosable errors
+            detail = ""
+            if isinstance(e, requests.HTTPError) and hasattr(e, "response") and e.response is not None:
+                detail = f" [HTTP {e.response.status_code}]"
+                try:
+                    body = e.response.text[:300]
+                    detail += f" {body}"
+                except Exception:
+                    pass
+            print(f"    ⚠️  Tile fetch error ({tile_x},{tile_y},z{zoom}): {e}{detail}")
+            if _tile_error_count == _TILE_ERROR_LOG_LIMIT:
+                print(f"    (suppressing further tile errors)")
         return None
 
 
@@ -505,9 +588,20 @@ def fetch_area_image(
         - Numpy array (H, W, 3) RGB image or None if failed
         - Metadata dict with bounds, tile info, etc.
     """
+    global _tile_error_count
+    _tile_error_count = 0  # Reset per-request error counter
+
     if zoom is None:
         zoom = config.ZOOM_LEVEL
-    
+
+    # Auto-reduce zoom if the resulting image would be too large for memory
+    safe = recommended_zoom(radius_m, center_lat, zoom)
+    if safe != zoom:
+        if show_progress:
+            print(f"⚠️  Zoom auto-reduced {zoom} → {safe} "
+                  f"(image at zoom {zoom} would exceed ~{MAX_IMAGE_PIXELS_SIDE}px limit)")
+        zoom = safe
+
     if tile_source is None:
         tile_source = DEFAULT_TILE_SOURCE
     
@@ -584,6 +678,11 @@ def fetch_area_image(
     iterator = tqdm(tiles, desc="Fetching tiles") if show_progress else tiles
     
     for tile_x, tile_y in iterator:
+        # Check for shutdown request every iteration so Ctrl+C takes effect
+        if _shutdown_event.is_set():
+            print("\n⚠️  Shutdown requested – aborting tile fetch")
+            break
+
         tile_img = None
         
         # Try primary source first

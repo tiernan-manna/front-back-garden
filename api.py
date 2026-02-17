@@ -25,13 +25,17 @@ Endpoints:
     POST /api/precompute             - Precompute a large area
     GET  /api/cache/stats            - Get cache statistics
     DELETE /api/cache                - Clear caches
+    POST /api/shutdown               - Gracefully stop the server
 """
 
 import asyncio
+import gc
 import os
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from enum import Enum
 from functools import partial
@@ -48,7 +52,7 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from src.tiles import TileSource, fetch_area_image
+from src.tiles import TileSource, fetch_area_image, request_shutdown, clear_shutdown
 from src.precompute import PrecomputeManager
 from src.fast_classifier import FastGardenClassifier, get_fast_classifier
 from src.osm import fetch_buildings
@@ -58,7 +62,8 @@ from src.osm import fetch_buildings
 # =============================================================================
 
 # Thread pool for running CPU-intensive classification work
-_executor = ThreadPoolExecutor(max_workers=8)
+# Keep low to limit memory: each task can hold large numpy arrays (~1-2 GB)
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 async def run_in_executor(func, *args, **kwargs):
@@ -281,6 +286,50 @@ async def geocode_eircode(eircode: str) -> Optional[Dict[str, float]]:
 
 
 # =============================================================================
+# Lifecycle & signal handling
+# =============================================================================
+
+_signal_count = 0
+
+
+def _handle_signal(signum, frame):
+    """
+    Handle SIGINT/SIGTERM:
+    - 1st signal: set the shutdown flag so Python-level loops abort, then
+      re-raise the default handler so uvicorn can shut down normally.
+    - 2nd signal: force-kill immediately with os._exit().  This is needed
+      when a worker is stuck inside a long-running C extension (e.g. OpenCV
+      on a huge image) that never returns to Python to check the flag.
+    """
+    global _signal_count
+    _signal_count += 1
+    request_shutdown()
+
+    if _signal_count >= 2:
+        print(f"\n⚠️  Force-killing process (signal {signum}, attempt {_signal_count})...")
+        os._exit(1)
+
+    print(f"\n⚠️  Signal {signum} received – shutting down (press Ctrl+C again to force-kill)...")
+    # Restore the default handler and re-raise so uvicorn handles shutdown
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup / shutdown lifecycle for the app."""
+    global _signal_count
+    # Startup: reset state and install signal handlers
+    _signal_count = 0
+    clear_shutdown()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    yield
+    # Shutdown: ensure flag is set so any in-flight tile loops exit
+    request_shutdown()
+
+
+# =============================================================================
 # FastAPI Application
 # =============================================================================
 
@@ -289,7 +338,8 @@ app = FastAPI(
     description="API for classifying front/back gardens and finding optimal delivery locations",
     version="1.1.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # CORS middleware for web access
@@ -481,6 +531,10 @@ def generate_pins_map(
         filepath = STATIC_DIR / filename
         cv2.imwrite(str(filepath), map_image)
         
+        # Free large image arrays
+        del image, map_image
+        gc.collect()
+        
         return filename
         
     except Exception as e:
@@ -634,6 +688,9 @@ async def get_garden_pins_batch(request: BatchPinRequest):
         if map_filename:
             map_url = f"/static/{map_filename}"
     
+    # Release memory from image/pin processing
+    gc.collect()
+
     return BatchPinResponse(
         pins=pins,
         count=len(pins),
@@ -721,6 +778,9 @@ async def precompute_area_endpoint(
         True   # show_progress
     )
     
+    # Release memory from heavy precompute processing
+    gc.collect()
+
     return PrecomputeResponse(
         status="completed",
         message=f"Precomputed {summary.get('total_buildings', 0)} buildings, "
@@ -765,6 +825,28 @@ async def clear_cache():
     return {"status": "cleared", "message": "All caches cleared"}
 
 
+@app.post("/api/shutdown")
+async def shutdown_server():
+    """
+    Gracefully shut down the server.
+
+    1. Sets the shutdown flag so in-flight tile fetches abort immediately.
+    2. Schedules a SIGTERM to the current process so uvicorn exits cleanly.
+
+    Usage:
+        curl -X POST http://localhost:8000/api/shutdown
+    """
+    request_shutdown()
+
+    # Give a moment for in-flight work to notice the flag, then kill ourselves
+    async def _terminate():
+        await asyncio.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    asyncio.ensure_future(_terminate())
+    return {"status": "shutting_down", "message": "Server is shutting down..."}
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -777,7 +859,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
-    parser.add_argument("--workers", type=int, default=4, help="Number of workers")
+    parser.add_argument("--workers", type=int, default=2, help="Number of workers (keep low to limit memory)")
     
     args = parser.parse_args()
     

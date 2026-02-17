@@ -38,6 +38,10 @@ env/
 output/
 cache/
 
+# Generated/temporary reports
+combine_report.txt
+combined_codebase.txt
+
 # API keys - never commit these!
 config_local.py
 

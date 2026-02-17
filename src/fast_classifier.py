@@ -384,6 +384,8 @@ class FastGardenClassifier:
             center_lat=lat,
             center_lon=lon,
             property_boundaries=property_boundaries,
+            tree_canopy_mask=tree_mask,  # For canopy density penalty
+            original_vegetation_mask=vegetation_mask,  # Full veg mask before texture split
         )
         
         # Get pins for nearest building

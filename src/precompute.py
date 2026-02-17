@@ -13,6 +13,7 @@ Previous approach: 4 hours for 500m (25 chunks x separate fetch + process each)
 New approach: ~1-3 minutes for 500m (1 fetch + 1 process + iterate buildings)
 """
 
+import gc
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ import config
 from src.tiles import (
     TileSource,
     fetch_area_image,
+    recommended_zoom,
 )
 from src.osm import (
     fetch_buildings,
@@ -42,7 +44,7 @@ from src.osm import (
     fetch_property_boundaries,
     geometry_to_pixel_coords,
 )
-from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
+from src.garden_detector import detect_green_areas, detect_vegetation_enhanced, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
 from src.classifier import GardenClassifier
 from src.delivery_pins import DeliveryPinFinder, DeliveryPin
 
@@ -94,7 +96,8 @@ class PrecomputeManager:
         self.cache_dir = cache_dir or PRECOMPUTE_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.tile_source = tile_source
-        self.zoom = zoom or config.ZOOM_LEVEL
+        self._preferred_zoom = zoom or config.ZOOM_LEVEL
+        self.zoom = self._preferred_zoom  # May be overridden per-request
         self.max_workers = max_workers
 
         self.index_file = self.cache_dir / "index.json"
@@ -162,6 +165,14 @@ class PrecomputeManager:
         7. Cache results
         """
         start_time = time.time()
+
+        # Auto-select a safe zoom for this radius so the stitched image
+        # stays within memory limits (~12k px per side → ~2-3 GB peak).
+        safe_zoom = recommended_zoom(radius_m, center_lat, self._preferred_zoom)
+        if safe_zoom != self._preferred_zoom and show_progress:
+            print(f"⚠️  Zoom reduced {self._preferred_zoom} → {safe_zoom} "
+                  f"for {radius_m:.0f}m radius (image would exceed memory limits)")
+        self.zoom = safe_zoom
 
         area_key = self._get_area_key(center_lat, center_lon, radius_m)
         cache_path = self._get_area_cache_path(area_key)
@@ -249,7 +260,20 @@ class PrecomputeManager:
             print(f"[3/5] Detecting vegetation...")
         t0 = time.time()
 
-        vegetation_mask, _ = detect_green_areas(image, show_progress=False, enhanced=False)
+        # Two-stage vegetation detection:
+        # 1. Broad HSV ranges (enhanced=True) to catch all possible grass
+        # 2. Excess Green Index (ExG = 2G-R-B) confirmation to reject false positives
+        # This prevents paved surfaces with slight green tint from being mis-classified,
+        # while still catching shadowed/muted grass that a single HSV range would miss.
+        # At lower zoom levels the ExG threshold is relaxed since colors are more muted.
+        exg_threshold = 0.05 if self.zoom <= 17 else 0.08
+        vegetation_mask = detect_vegetation_enhanced(image, use_texture=False)
+
+        # Refine: re-apply ExG at our zoom-aware threshold (the function uses 0.1 internally)
+        image_float = image.astype(np.float32) / 255.0
+        exg = 2 * image_float[:,:,1] - image_float[:,:,0] - image_float[:,:,2]
+        vegetation_mask[exg < exg_threshold] = 0
+        del image_float, exg
 
         # Convert to pixel coords and exclude buildings/roads from vegetation
         building_polys_px = []
@@ -331,6 +355,8 @@ class PrecomputeManager:
         if show_progress:
             print(f"    Classification complete ({time.time()-t0:.1f}s)")
 
+        gc.collect()
+
         # ---- STEP 5: Find pins - ONE per building per garden type ----
         if show_progress:
             print(f"[5/5] Finding delivery pins for {len(buildings)} buildings...")
@@ -348,12 +374,19 @@ class PrecomputeManager:
             center_lon=center_lon,
             building_directions=getattr(classifier, 'building_directions', None),
             property_boundaries=property_boundaries,
+            tree_canopy_mask=tree_mask,  # For canopy density penalty
+            original_vegetation_mask=vegetation_mask,  # Full veg mask before texture split
+            building_polys_px=building_polys_px,  # Reuse from step 3
+            road_lines_px=road_lines_px,           # Reuse from step 3
         )
+        del vegetation_mask  # No longer needed after pin_finder takes a reference
 
         all_pins: List[DeliveryPin] = []
         seen_buildings: Set[str] = set()
 
-        for idx in range(len(buildings)):
+        for idx in tqdm(range(len(buildings)),
+                        desc="Placing pins",
+                        disable=not show_progress):
             # Get a stable building ID
             building = buildings.iloc[idx]
             building_id = None
@@ -424,6 +457,16 @@ class PrecomputeManager:
         if show_progress:
             print(f"    Found {len(all_pins)} pins ({time.time()-t0:.1f}s)")
 
+        # Save count before freeing references
+        num_buildings = len(buildings)
+
+        # Free all large objects before caching (peak memory reduction)
+        del image, classification_mask, grass_mask, tree_mask
+        del building_polys_px, road_lines_px
+        del classifier, pin_finder
+        del buildings, roads, driveways, address_polygons, property_boundaries
+        gc.collect()
+
         # ---- Cache results ----
         num_front = sum(1 for p in all_pins if p.garden_type == "front" and p.score > 0)
         num_back = sum(1 for p in all_pins if p.garden_type == "back" and p.score > 0)
@@ -436,7 +479,7 @@ class PrecomputeManager:
             zoom=self.zoom,
             tile_source=self.tile_source.value if hasattr(self.tile_source, 'value') else str(self.tile_source),
             computed_at=time.time(),
-            num_buildings=len(buildings),
+            num_buildings=num_buildings,
             num_front_gardens=num_front,
             num_back_gardens=num_back,
             delivery_pins=[pin.to_dict() for pin in all_pins],
@@ -456,7 +499,7 @@ class PrecomputeManager:
                 "radius_m": radius_m,
                 "computed_at": precomputed.computed_at,
                 "num_pins": len(all_pins),
-                "num_buildings": len(buildings),
+                "num_buildings": num_buildings,
             }
         self._save_index()
 
@@ -464,7 +507,7 @@ class PrecomputeManager:
 
         if show_progress:
             print(f"\nPrecompute complete:")
-            print(f"   Buildings: {len(buildings)}")
+            print(f"   Buildings: {num_buildings}")
             print(f"   Front pins: {num_front}")
             print(f"   Back pins: {num_back}")
             print(f"   No garden: {num_no_garden}")
@@ -475,7 +518,7 @@ class PrecomputeManager:
             "center_lon": center_lon,
             "radius_m": radius_m,
             "total_pins": len(all_pins),
-            "total_buildings": len(buildings),
+            "total_buildings": num_buildings,
             "num_front": num_front,
             "num_back": num_back,
             "num_no_garden": num_no_garden,
@@ -489,9 +532,20 @@ class PrecomputeManager:
     # ------------------------------------------------------------------
 
     def is_area_cached(self, center_lat: float, center_lon: float, radius_m: float) -> bool:
-        """Check if the exact area is cached."""
+        """Check if the exact area is cached (accounts for zoom auto-reduction)."""
+        # Check with current zoom
         area_key = self._get_area_key(center_lat, center_lon, radius_m)
-        return self._get_area_cache_path(area_key).exists()
+        if self._get_area_cache_path(area_key).exists():
+            return True
+        # Also check with the zoom that would actually be used after auto-reduction
+        safe_zoom = recommended_zoom(radius_m, center_lat, self._preferred_zoom)
+        if safe_zoom != self.zoom:
+            saved = self.zoom
+            self.zoom = safe_zoom
+            area_key = self._get_area_key(center_lat, center_lon, radius_m)
+            self.zoom = saved
+            return self._get_area_cache_path(area_key).exists()
+        return False
 
     def get_pins_in_radius(
         self,
@@ -529,6 +583,10 @@ class PrecomputeManager:
             summary = self.precompute_area(center_lat, center_lon, radius_m, show_progress=True)
             if "error" in summary:
                 return []
+            # Re-compute cache path: precompute_area may have changed self.zoom
+            # (e.g. auto-reduced from 19 to 17 for large radii)
+            area_key = self._get_area_key(center_lat, center_lon, radius_m)
+            cache_path = self._get_area_cache_path(area_key)
             # Re-load from cache
             try:
                 with open(cache_path, "rb") as f:
