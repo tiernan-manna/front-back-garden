@@ -227,7 +227,15 @@ class PrecomputeManager:
         t0 = time.time()
 
         buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
+        if show_progress:
+            print(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
+        
+        t1 = time.time()
         roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
+        if show_progress:
+            print(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
+        
+        t1 = time.time()
         driveways = fetch_driveways(center_lat, center_lon, radius_m, show_progress=False)
 
         try:
@@ -241,7 +249,9 @@ class PrecomputeManager:
             property_boundaries = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
         if show_progress:
-            print(f"    {len(buildings)} buildings, {len(roads)} roads, {len(property_boundaries)} boundaries ({time.time()-t0:.1f}s)")
+            print(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
+                  f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
+            print(f"    OSM total: {time.time()-t0:.1f}s")
 
         if buildings.empty:
             return {
@@ -379,7 +389,13 @@ class PrecomputeManager:
             building_polys_px=building_polys_px,  # Reuse from step 3
             road_lines_px=road_lines_px,           # Reuse from step 3
         )
-        del vegetation_mask  # No longer needed after pin_finder takes a reference
+        # Free large objects no longer needed -- pin_finder holds its own references.
+        # This must happen BEFORE the pin loop triggers lazy inits that allocate more.
+        # Keep building_directions for no_garden fallback pin placement.
+        _building_directions = getattr(classifier, 'building_directions', {})
+        del image, vegetation_mask, classification_mask, grass_mask, tree_mask
+        del classifier, building_polys_px, road_lines_px
+        gc.collect()
 
         all_pins: List[DeliveryPin] = []
         seen_buildings: Set[str] = set()
@@ -413,7 +429,7 @@ class PrecomputeManager:
                 centroid = building.geometry.centroid
                 expected_lat, expected_lon = centroid.y, centroid.x
                 bld_idx_original = buildings.index[idx]
-                direction_info = classifier.building_directions.get(bld_idx_original)
+                direction_info = _building_directions.get(bld_idx_original)
                 if direction_info:
                     road_dir = direction_info.get("direction_to_road")
                     if road_dir is not None and np.linalg.norm(road_dir) > 0.1:
@@ -438,7 +454,7 @@ class PrecomputeManager:
                 centroid = building.geometry.centroid
                 expected_lat, expected_lon = centroid.y, centroid.x
                 bld_idx_original = buildings.index[idx]
-                direction_info = classifier.building_directions.get(bld_idx_original)
+                direction_info = _building_directions.get(bld_idx_original)
                 if direction_info:
                     road_dir = direction_info.get("direction_to_road")
                     if road_dir is not None and np.linalg.norm(road_dir) > 0.1:
@@ -454,16 +470,83 @@ class PrecomputeManager:
                     metadata={}
                 ))
 
+        # ---- POST-PROCESSING: Validate front/back pin placement ----
+        # Rule: The front pin MUST be closer to a road than the back pin.
+        # If not, swap them.
+        # Reuse pin_finder's road distance transform (already computed).
+        _road_dist_val = pin_finder.distance_to_road
+        _h, _w = image_size[1], image_size[0]
+
+        swapped_count = 0
+        pins_by_bld = {}
+        for p in all_pins:
+            bid = p.building_id
+            if bid not in pins_by_bld:
+                pins_by_bld[bid] = {}
+            pins_by_bld[bid][p.garden_type] = p
+
+        for bid, bpins in pins_by_bld.items():
+            fp = bpins.get("front")
+            bp = bpins.get("back")
+            if fp is None or bp is None:
+                continue
+            if fp.score == 0 or bp.score == 0:
+                continue
+
+            # Convert to pixels
+            fpx = int((fp.lon - geo_bounds["west"]) / (geo_bounds["east"] - geo_bounds["west"]) * _w)
+            fpy = int((geo_bounds["north"] - fp.lat) / (geo_bounds["north"] - geo_bounds["south"]) * _h)
+            bpx = int((bp.lon - geo_bounds["west"]) / (geo_bounds["east"] - geo_bounds["west"]) * _w)
+            bpy = int((geo_bounds["north"] - bp.lat) / (geo_bounds["north"] - geo_bounds["south"]) * _h)
+
+            fpx = max(0, min(_w - 1, fpx))
+            fpy = max(0, min(_h - 1, fpy))
+            bpx = max(0, min(_w - 1, bpx))
+            bpy = max(0, min(_h - 1, bpy))
+
+            front_road_dist = _road_dist_val[fpy, fpx]
+            back_road_dist = _road_dist_val[bpy, bpx]
+
+            if front_road_dist > back_road_dist * 1.3:
+                # Back pin is closer to road than front → swap
+                fp.garden_type, bp.garden_type = "back", "front"
+                fp.score, bp.score = bp.score, fp.score
+                fp.surface_type, bp.surface_type = bp.surface_type, fp.surface_type
+                fp.lat, bp.lat = bp.lat, fp.lat
+                fp.lon, bp.lon = bp.lon, fp.lon
+                fp.distance_to_building_m, bp.distance_to_building_m = bp.distance_to_building_m, fp.distance_to_building_m
+                fp.metadata, bp.metadata = bp.metadata, fp.metadata
+                swapped_count += 1
+
+        del _road_dist_val
+
+        if show_progress and swapped_count > 0:
+            print(f"    Front/back swap correction: {swapped_count} buildings fixed")
+
         if show_progress:
+            # Report attempt distribution
+            from collections import Counter
+            attempt_counts = Counter()
+            for p in all_pins:
+                att = p.metadata.get("attempt", 0)
+                attempt_counts[att] += 1
+            total_with_attempt = sum(v for k, v in attempt_counts.items() if k > 0)
+            if total_with_attempt > 0:
+                parts = []
+                for att in sorted(attempt_counts.keys()):
+                    if att == 0:
+                        continue
+                    count = attempt_counts[att]
+                    pct = 100 * count / total_with_attempt
+                    parts.append(f"A{att}={count}({pct:.0f}%)")
+                print(f"    Attempt stats: {', '.join(parts)}, no_garden={attempt_counts.get(0, 0)}")
             print(f"    Found {len(all_pins)} pins ({time.time()-t0:.1f}s)")
 
         # Save count before freeing references
         num_buildings = len(buildings)
 
-        # Free all large objects before caching (peak memory reduction)
-        del image, classification_mask, grass_mask, tree_mask
-        del building_polys_px, road_lines_px
-        del classifier, pin_finder
+        # Free remaining large objects before caching
+        del pin_finder, _building_directions
         del buildings, roads, driveways, address_polygons, property_boundaries
         gc.collect()
 

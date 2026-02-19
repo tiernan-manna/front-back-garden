@@ -256,14 +256,16 @@ class GardenClassifier:
                         pass
                 
                 # Priority 2: Driveway nearest (STRtree O(log n) lookup)
+                # Uses building EDGE distance (not centroid) so driveways that
+                # touch the building edge are detected even when the centroid is far.
                 if direction is None and has_driveways:
                     try:
-                        nearest_idx = driveway_tree.nearest(centroid)
+                        nearest_idx = driveway_tree.nearest(building.geometry)
                         nearest_dw = driveway_geoms[nearest_idx]
-                        nearest_dw_point = nearest_points(centroid, nearest_dw)[1]
-                        driveway_dist = centroid.distance(nearest_dw_point)
+                        edge_dist = building.geometry.distance(nearest_dw)
                         
-                        if driveway_dist < 30:
+                        if edge_dist < 25:
+                            nearest_dw_point = nearest_points(centroid, nearest_dw)[1]
                             dx = nearest_dw_point.x - centroid.x
                             dy = nearest_dw_point.y - centroid.y
                             length = np.sqrt(dx**2 + dy**2)
@@ -310,64 +312,57 @@ class GardenClassifier:
         
         print(f"    Front direction: {address_count} from address, {driveway_count} from driveways, {road_count} from roads")
         
-        # ---- CONSENSUS CORRECTION ----
-        # Buildings that used "nearest road" fallback may face the wrong way
-        # (e.g., closer to a road behind the house). Use nearby buildings with
-        # reliable directions (address/driveway-matched) to correct them.
-        reliable_idxs = []
-        reliable_centroids = []
-        reliable_dirs = []
-        unreliable_idxs = []
-        unreliable_centroids = []
+        # ---- ROAD PROXIMITY VERIFICATION ----
+        # For every building, verify the computed direction by checking which
+        # side of the building is actually closer to a road.  This is more
+        # reliable than consensus (which can cascade wrong directions across
+        # entire streets).  Skip address/driveway-matched buildings since
+        # those are already high-confidence.
+        #
+        # The nearest-road direction is recomputed from the building's nearest
+        # EDGE to the nearest road (not centroid-to-road, which can be misleading
+        # for large or irregular buildings).
+        proximity_verified = 0
         
         for b_idx, info in self.building_directions.items():
-            c = info["centroid"]
-            if info["source"] in ("address", "driveway"):
-                reliable_idxs.append(b_idx)
-                reliable_centroids.append([c.x, c.y])
-                reliable_dirs.append(info["direction_to_road"])
-            elif info["source"] == "road":
-                unreliable_idxs.append(b_idx)
-                unreliable_centroids.append([c.x, c.y])
-        
-        if len(reliable_centroids) >= 3 and unreliable_centroids:
-            reliable_arr = np.array(reliable_centroids)
-            reliable_dirs_arr = np.array(reliable_dirs)
-            reliable_tree = cKDTree(reliable_arr)
+            src = info["source"]
+            if src in ("address", "driveway"):
+                continue  # Already reliable
             
-            corrected = 0
-            for i, b_idx in enumerate(unreliable_idxs):
-                pt = np.array([unreliable_centroids[i]])
-                k = min(7, len(reliable_centroids))
-                dists, indices = reliable_tree.query(pt, k=k)
-                dists = dists[0] if k > 1 else [dists[0]]
-                indices = indices[0] if k > 1 else [indices[0]]
-                
-                # Gather directions from reliable neighbors within 60m
-                nearby_dirs = []
-                for j, d in zip(indices, dists):
-                    if d < 60:
-                        nearby_dirs.append(reliable_dirs_arr[j])
-                
-                if len(nearby_dirs) >= 2:
-                    avg_dir = np.mean(nearby_dirs, axis=0)
-                    avg_len = np.linalg.norm(avg_dir)
-                    if avg_len > 0.3:
-                        avg_dir = avg_dir / avg_len
-                        current_dir = self.building_directions[b_idx]["direction_to_road"]
-                        dot = np.dot(current_dir, avg_dir)
-                        if dot < 0.0:
-                            # Facing opposite to neighbors → adopt neighbor consensus
-                            self.building_directions[b_idx]["direction_to_road"] = avg_dir
-                            self.building_directions[b_idx]["source"] = "consensus"
-                            corrected += 1
+            d = info["direction_to_road"]
+            if d is None or np.linalg.norm(d) < 0.1:
+                continue
             
-            if corrected > 0:
-                print(f"    Consensus correction: {corrected}/{len(unreliable_idxs)} road-fallback directions fixed")
+            centroid = info["centroid"]
+            
+            # Find nearest road to building centroid (fast STRtree lookup)
+            nearest_idx = road_tree.nearest(centroid)
+            nearest_road_pt = nearest_points(centroid, road_geoms[nearest_idx])[1]
+            
+            # Direction from centroid to nearest road
+            dx = nearest_road_pt.x - centroid.x
+            dy = nearest_road_pt.y - centroid.y
+            length = np.sqrt(dx**2 + dy**2)
+            
+            if length < 0.1:
+                continue
+            
+            road_dir = np.array([dx / length, dy / length])
+            
+            # If current direction disagrees with nearest-road direction, adopt road direction
+            dot = np.dot(d, road_dir)
+            if dot < 0.3:  # Facing >72deg away from nearest road
+                info["direction_to_road"] = road_dir
+                info["source"] = "road_verified"
+                proximity_verified += 1
         
-        # ---- OUTLIER DETECTION for address-matched buildings ----
-        # Even address-matched buildings can face wrong when a street curves around.
-        # Check each building against its closest 5 neighbors; if it's an outlier, fix.
+        if proximity_verified > 0:
+            print(f"    Road proximity verification: {proximity_verified} directions corrected")
+        
+        # ---- OUTLIER DETECTION ----
+        # Final pass: buildings facing opposite to ALL close neighbors are likely
+        # wrong. Only flip when evidence is very strong (nearly 180deg off from
+        # 4+ neighbors within 40m).
         if len(self.building_directions) > 10:
             all_idxs = list(self.building_directions.keys())
             all_centroids = np.array([[self.building_directions[i]["centroid"].x,
@@ -377,12 +372,13 @@ class GardenClassifier:
             
             outlier_fixed = 0
             for i, b_idx in enumerate(all_idxs):
-                k = min(8, len(all_idxs))
+                if self.building_directions[b_idx]["source"] in ("address", "driveway"):
+                    continue
+                k = min(10, len(all_idxs))
                 dists, indices = all_tree.query(all_centroids[i:i+1], k=k)
                 dists = dists[0]
                 indices = indices[0]
                 
-                # Skip self (index 0) and get neighbors within 40m
                 neighbor_dirs = []
                 for j, d in zip(indices[1:], dists[1:]):
                     if d < 40:
@@ -391,23 +387,18 @@ class GardenClassifier:
                 if len(neighbor_dirs) >= 4:
                     avg = np.mean(neighbor_dirs, axis=0)
                     avg_len = np.linalg.norm(avg)
-                    if avg_len > 0.5:  # Strong neighbor consensus
+                    if avg_len > 0.6:
                         avg = avg / avg_len
                         my_dir = all_dirs[i]
                         dot = np.dot(my_dir, avg)
-                        if dot < -0.3:  # Facing opposite to most neighbors
+                        if dot < -0.7:  # Nearly 180deg off
                             self.building_directions[b_idx]["direction_to_road"] = avg
                             self.building_directions[b_idx]["source"] += "+outlier_fix"
-                            all_dirs[i] = avg  # Update for subsequent checks
+                            all_dirs[i] = avg
                             outlier_fixed += 1
             
             if outlier_fixed > 0:
                 print(f"    Outlier correction: {outlier_fixed} buildings fixed to match neighbors")
-        
-        # NOTE: Pixel-based road proximity flipping was removed because it corrupted
-        # the classification mask (flipping too many correct directions). Instead,
-        # the pin finder uses direction-agnostic fallback: if no grass is found
-        # in the primary direction, it tries the opposite direction.
     
     def classify_pixel(
         self,
@@ -565,115 +556,68 @@ class GardenClassifier:
         else:
             working_mask = garden_mask
         
-        # Step 1: Create building centroid and road direction arrays in pixel space
-        if show_progress:
-            print("Building direction map...")
+        # Building-direction classification: each pixel is classified based on
+        # its OWNER BUILDING's road direction (not the pixel's own nearest road).
+        # This prevents back garden pixels from being mis-classified as FRONT
+        # when they happen to be near a road behind the next row of houses.
         
-        building_data = []  # (centroid_x, centroid_y, road_dir_x, road_dir_y)
-        
-        for idx in tqdm(self.building_directions.keys(), desc="Processing buildings", disable=not show_progress):
+        # Build array of (centroid_x, centroid_y, road_dir_x, road_dir_y)
+        building_data = []
+        for idx in self.building_directions.keys():
             info = self.building_directions[idx]
-            
-            # Get building in WGS84 for pixel conversion
             if idx not in self.buildings_wgs.index:
                 continue
-                
-            building_wgs = self.buildings_wgs.loc[idx]
-            centroid_wgs = building_wgs.geometry.centroid
-            
-            # Convert centroid to pixel coordinates
-            cx = int((centroid_wgs.x - self.geo_bounds["west"]) / 
-                    (self.geo_bounds["east"] - self.geo_bounds["west"]) * width)
-            cy = int((self.geo_bounds["north"] - centroid_wgs.y) / 
-                    (self.geo_bounds["north"] - self.geo_bounds["south"]) * height)
-            
-            # Get road direction (already computed in meters, direction is unitless)
+            bwgs = self.buildings_wgs.loc[idx]
+            c = bwgs.geometry.centroid
+            cx = int((c.x - self.geo_bounds["west"]) / (self.geo_bounds["east"] - self.geo_bounds["west"]) * width)
+            cy = int((self.geo_bounds["north"] - c.y) / (self.geo_bounds["north"] - self.geo_bounds["south"]) * height)
             road_dir = info["direction_to_road"]
-            
             if np.linalg.norm(road_dir) > 0.1:
                 building_data.append((cx, cy, road_dir[0], road_dir[1]))
         
         if not building_data:
             return result
         
-        building_arr = np.array(building_data)  # Shape: (n_buildings, 4)
+        building_arr = np.array(building_data)
         
-        # Step 2: Get all garden pixel coordinates (excluding public spaces)
         garden_ys, garden_xs = np.where(working_mask > 0)
         n_pixels = len(garden_xs)
-        
         if n_pixels == 0:
             return result
         
         if show_progress:
             print(f"Classifying {n_pixels:,} garden pixels...")
         
-        # Step 3: Build KDTree of building centroids for fast nearest lookup
-        building_centroids = building_arr[:, :2]  # (x, y)
+        # KDTree for fast nearest-building lookup
+        building_centroids = building_arr[:, :2]
         tree = cKDTree(building_centroids)
-        
-        # Step 4: Find nearest building for each garden pixel (vectorized!)
         garden_points = np.column_stack([garden_xs, garden_ys])
-        
-        # Query KDTree for nearest building - this is O(n log m) instead of O(n*m)
         distances, nearest_indices = tree.query(garden_points, k=1, workers=-1)
         
-        # Step 5: Classify based on direction to road
-        # For each pixel, compute direction from building centroid to pixel
-        # Dot product with road direction determines front/back
-        
-        if show_progress:
-            pbar = tqdm(total=3, desc="Computing classifications")
-        
-        # Get the building data for each pixel's nearest building
-        nearest_buildings = building_arr[nearest_indices]  # Shape: (n_pixels, 4)
-        
-        # Direction from building centroid to pixel
+        # For each pixel: direction from building centroid to pixel
+        nearest_buildings = building_arr[nearest_indices]
         pixel_dir_x = garden_xs - nearest_buildings[:, 0]
         pixel_dir_y = garden_ys - nearest_buildings[:, 1]
         
-        if show_progress:
-            pbar.update(1)
-        
-        # Normalize pixel directions
-        pixel_lengths = np.sqrt(pixel_dir_x**2 + pixel_dir_y**2)
-        pixel_lengths = np.maximum(pixel_lengths, 0.1)  # Avoid division by zero
-        pixel_dir_x = pixel_dir_x / pixel_lengths
-        pixel_dir_y = pixel_dir_y / pixel_lengths
-        
-        if show_progress:
-            pbar.update(1)
-        
-        # Road directions for each pixel's nearest building
+        # Building's road direction (in meters: x=east, y=north)
+        # Negate y for image coords (y increases downward)
         road_dir_x = nearest_buildings[:, 2]
         road_dir_y = nearest_buildings[:, 3]
-        
-        # Dot product: positive = toward road (front), negative = away (back)
-        # Note: Y is inverted in image coordinates, so we negate road_dir_y
         dot_products = pixel_dir_x * road_dir_x + pixel_dir_y * (-road_dir_y)
         
-        # Classify based on dot product
-        # Also filter by distance (only classify pixels within reasonable distance of a building)
-        max_distance = 200  # pixels - increased to catch more gardens
+        max_distance = 200
         valid_mask = distances < max_distance
         
-        front_mask = (dot_products > 0.2) & valid_mask
-        back_mask = (dot_products < -0.2) & valid_mask
+        front_mask = (dot_products > 0) & valid_mask
+        back_mask = (dot_products <= 0) & valid_mask
         
-        # Apply classifications
         result[garden_ys[front_mask], garden_xs[front_mask]] = self.FRONT_GARDEN
         result[garden_ys[back_mask], garden_xs[back_mask]] = self.BACK_GARDEN
         
-        # For ambiguous pixels (side gardens), use slight bias
-        ambiguous_mask = (~front_mask) & (~back_mask) & valid_mask
-        result[garden_ys[ambiguous_mask & (dot_products >= 0)], 
-               garden_xs[ambiguous_mask & (dot_products >= 0)]] = self.FRONT_GARDEN
-        result[garden_ys[ambiguous_mask & (dot_products < 0)], 
-               garden_xs[ambiguous_mask & (dot_products < 0)]] = self.BACK_GARDEN
-        
         if show_progress:
-            pbar.update(1)
-            pbar.close()
+            n_front = int(np.sum(front_mask))
+            n_back = int(np.sum(back_mask))
+            print(f"    {n_front:,} front, {n_back:,} back pixels")
         
         # OVERRIDE: Driveway-adjacent areas are ALWAYS front garden
         # Driveways are the strongest indicator of "front" - they connect to roads

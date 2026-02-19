@@ -251,14 +251,23 @@ def fetch_roads(
         roads = edges[cols_to_keep].reset_index(drop=True)
         
         # Filter to only front-facing roads (exclude footways, service roads, etc.)
+        # OSM can return highway as a list when a road has multiple tags
+        # (e.g. ['residential', 'footway']).  We keep the road if ANY tag
+        # matches a front-facing type.
         if front_facing_only and "highway" in roads.columns:
-            front_road_types = [
+            front_road_types = {
                 "residential", "tertiary", "secondary", "primary",
                 "tertiary_link", "secondary_link", "primary_link",
                 "living_street", "unclassified"
-            ]
+            }
             original_count = len(roads)
-            roads = roads[roads["highway"].isin(front_road_types)].reset_index(drop=True)
+            
+            def _is_front_road(hw):
+                if isinstance(hw, list):
+                    return any(t in front_road_types for t in hw)
+                return hw in front_road_types
+            
+            roads = roads[roads["highway"].apply(_is_front_road)].reset_index(drop=True)
             if show_progress:
                 print(f"    Filtered to {len(roads)} front-facing roads (from {original_count} total)")
         
