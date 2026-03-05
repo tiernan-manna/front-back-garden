@@ -43,6 +43,7 @@ from src.osm import (
     fetch_address_polygons,
     fetch_property_boundaries,
     geometry_to_pixel_coords,
+    project_to_meters,
 )
 from src.garden_detector import detect_green_areas, detect_vegetation_enhanced, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
 from src.classifier import GardenClassifier
@@ -504,24 +505,322 @@ class PrecomputeManager:
             bpx = max(0, min(_w - 1, bpx))
             bpy = max(0, min(_h - 1, bpy))
 
-            front_road_dist = _road_dist_val[fpy, fpx]
-            back_road_dist = _road_dist_val[bpy, bpx]
-
-            if front_road_dist > back_road_dist * 1.3:
-                # Back pin is closer to road than front → swap
-                fp.garden_type, bp.garden_type = "back", "front"
-                fp.score, bp.score = bp.score, fp.score
-                fp.surface_type, bp.surface_type = bp.surface_type, fp.surface_type
-                fp.lat, bp.lat = bp.lat, fp.lat
-                fp.lon, bp.lon = bp.lon, fp.lon
-                fp.distance_to_building_m, bp.distance_to_building_m = bp.distance_to_building_m, fp.distance_to_building_m
-                fp.metadata, bp.metadata = bp.metadata, fp.metadata
+            front_road_dist = float(_road_dist_val[fpy, fpx])
+            back_road_dist = float(_road_dist_val[bpy, bpx])
+            
+            # Check separation between front and back pins
+            sep_m = np.sqrt(((fp.lat - bp.lat) * 111320)**2 +
+                            ((fp.lon - bp.lon) * 111320 * np.cos(np.radians(center_lat)))**2)
+            
+            should_swap = False
+            
+            # Rule 1: Back pin is closer to road than front → swap
+            if front_road_dist > back_road_dist * 1.05:
+                should_swap = True
+            
+            # Rule 2: Both pins within 8m of each other (same garden) and
+            # back pin is at least as close to road → swap
+            if sep_m < 8 and back_road_dist <= front_road_dist:
+                should_swap = True
+            
+            if should_swap:
+                fp.garden_type = "back"
+                bp.garden_type = "front"
                 swapped_count += 1
 
         del _road_dist_val
 
         if show_progress and swapped_count > 0:
             print(f"    Front/back swap correction: {swapped_count} buildings fixed")
+
+        # ---- POST-PROCESSING: Same-side pin correction ----
+        # When front and back pins are very close together, they're in the
+        # same garden.  Re-search for the lower-scored pin on the opposite
+        # side of the building, then assign front/back labels by road distance
+        # (front = closer to road).
+        _road_dist = pin_finder.distance_to_road
+        _h2, _w2 = image_size[1], image_size[0]
+        same_side_fixed = 0
+        same_side_label_swapped = 0
+        for bid, bpins in pins_by_bld.items():
+            fp = bpins.get("front")
+            bp = bpins.get("back")
+            if fp is None or bp is None:
+                continue
+            if fp.score == 0 or bp.score == 0:
+                continue
+
+            sep_m = np.sqrt(
+                ((fp.lat - bp.lat) * 111320) ** 2
+                + ((fp.lon - bp.lon) * 111320 * np.cos(np.radians(center_lat))) ** 2
+            )
+            if sep_m >= 8:
+                continue
+
+            # Determine which pin to keep (higher score stays)
+            keep, redo = (fp, bp) if fp.score >= bp.score else (bp, fp)
+            redo_type = redo.garden_type
+
+            # Direction from building centroid to kept pin (in pixel space)
+            keep_px = int(
+                (keep.lon - geo_bounds["west"])
+                / (geo_bounds["east"] - geo_bounds["west"])
+                * _w2
+            )
+            keep_py = int(
+                (geo_bounds["north"] - keep.lat)
+                / (geo_bounds["north"] - geo_bounds["south"])
+                * _h2
+            )
+
+            # Find the positional building index for pin_finder
+            bld_pos_idx = None
+            for pos_idx in range(len(buildings)):
+                b = buildings.iloc[pos_idx]
+                b_id = None
+                if "osm_id" in b.index:
+                    b_id = str(b["osm_id"])
+                elif hasattr(b, "name") and b.name is not None:
+                    b_id = str(b.name)
+                else:
+                    b_id = f"bld_{pos_idx}"
+                if b_id == bid:
+                    bld_pos_idx = pos_idx
+                    break
+            if bld_pos_idx is None:
+                continue
+
+            # Building centroid in pixels
+            c = buildings.iloc[bld_pos_idx].geometry.centroid
+            bld_cx = int(
+                (c.x - geo_bounds["west"])
+                / (geo_bounds["east"] - geo_bounds["west"])
+                * _w2
+            )
+            bld_cy = int(
+                (geo_bounds["north"] - c.y)
+                / (geo_bounds["north"] - geo_bounds["south"])
+                * _h2
+            )
+
+            exclude_dir = (keep_px - bld_cx, keep_py - bld_cy)
+            if abs(exclude_dir[0]) < 1 and abs(exclude_dir[1]) < 1:
+                continue
+
+            new_pin = pin_finder.find_best_pin_for_building(
+                bld_pos_idx, redo_type, exclude_direction=exclude_dir
+            )
+            if new_pin and new_pin.score > 0:
+                redo.lat = new_pin.lat
+                redo.lon = new_pin.lon
+                redo.score = new_pin.score
+                redo.surface_type = new_pin.surface_type
+                redo.distance_to_building_m = new_pin.distance_to_building_m
+                redo.metadata = new_pin.metadata
+                same_side_fixed += 1
+            else:
+                offset_m = 5.0
+                dlat = c.y - keep.lat
+                dlon = c.x - keep.lon
+                geo_len = np.sqrt((dlat * 111320) ** 2 + (dlon * 111320 * np.cos(np.radians(center_lat))) ** 2)
+                if geo_len > 0.5:
+                    opp_lat = c.y + dlat / geo_len * offset_m / 111320
+                    opp_lon = c.x + dlon / geo_len * offset_m / (111320 * np.cos(np.radians(center_lat)))
+                else:
+                    opp_lat, opp_lon = c.y, c.x
+                redo.lat = opp_lat
+                redo.lon = opp_lon
+                redo.score = 0.0
+                redo.surface_type = "no_garden"
+                redo.distance_to_building_m = 0.0
+                redo.metadata = {}
+                same_side_fixed += 1
+
+            # After relocation, assign front/back labels by road distance:
+            # the pin closer to a road is "front", the other is "back".
+            # Use garden_type to find current front/back (dict keys may
+            # disagree after earlier swaps).
+            if fp.garden_type == "front":
+                cur_fp, cur_bp = fp, bp
+            else:
+                cur_fp, cur_bp = bp, fp
+
+            cfpx = max(0, min(_w2 - 1, int((cur_fp.lon - geo_bounds["west"]) / (geo_bounds["east"] - geo_bounds["west"]) * _w2)))
+            cfpy = max(0, min(_h2 - 1, int((geo_bounds["north"] - cur_fp.lat) / (geo_bounds["north"] - geo_bounds["south"]) * _h2)))
+            cbpx = max(0, min(_w2 - 1, int((cur_bp.lon - geo_bounds["west"]) / (geo_bounds["east"] - geo_bounds["west"]) * _w2)))
+            cbpy = max(0, min(_h2 - 1, int((geo_bounds["north"] - cur_bp.lat) / (geo_bounds["north"] - geo_bounds["south"]) * _h2)))
+
+            f_road = float(_road_dist[cfpy, cfpx])
+            b_road = float(_road_dist[cbpy, cbpx])
+
+            if f_road > b_road * 1.05:
+                cur_fp.garden_type = "back"
+                cur_bp.garden_type = "front"
+                same_side_label_swapped += 1
+
+        del _road_dist
+
+        if show_progress and same_side_fixed > 0:
+            print(f"    Same-side pin correction: {same_side_fixed} buildings relocated, {same_side_label_swapped} labels swapped")
+
+        # ---- POST-PROCESSING: Address-road distance label fix ----
+        # For buildings matched to a named street, measure each pin's
+        # distance to THAT specific road (not any road).  The pin closer
+        # to the address-matched road is "front".  This avoids false
+        # swaps from walkways/back lanes in the generic road raster.
+        has_addrs = (
+            address_polygons is not None
+            and not address_polygons.empty
+            and "addr:street" in address_polygons.columns
+        )
+        addr_road_fixed = 0
+        addr_road_fixed_bids: Set[str] = set()
+        if has_addrs:
+            from shapely.ops import nearest_points as _np_addr
+
+            roads_m_pp = project_to_meters(roads, center_lat, center_lon)
+            buildings_m_pp = project_to_meters(buildings, center_lat, center_lon)
+            addrs_m_pp = project_to_meters(address_polygons, center_lat, center_lon)
+
+            street_road_geoms: Dict[str, List] = {}
+            if "name" in roads.columns:
+                for ri in range(len(roads)):
+                    rname = roads.iloc[ri].get("name", None)
+                    if isinstance(rname, str) and len(rname) > 1:
+                        key = rname.strip().lower()
+                        if key not in street_road_geoms:
+                            street_road_geoms[key] = []
+                        street_road_geoms[key].append(roads_m_pp.iloc[ri].geometry)
+
+            bld_id_to_pos = {}
+            for pos_idx in range(len(buildings)):
+                b = buildings.iloc[pos_idx]
+                if "osm_id" in b.index:
+                    b_id = str(b["osm_id"])
+                elif hasattr(b, "name") and b.name is not None:
+                    b_id = str(b.name)
+                else:
+                    b_id = f"bld_{pos_idx}"
+                bld_id_to_pos[b_id] = pos_idx
+
+            for bid, bpins in pins_by_bld.items():
+                pin_a = bpins.get("front")
+                pin_b = bpins.get("back")
+                if pin_a is None or pin_b is None:
+                    continue
+                if pin_a.garden_type == "front":
+                    cur_fp, cur_bp = pin_a, pin_b
+                else:
+                    cur_fp, cur_bp = pin_b, pin_a
+                if cur_fp.score == 0 or cur_bp.score == 0:
+                    continue
+
+                pos_idx = bld_id_to_pos.get(bid)
+                if pos_idx is None:
+                    continue
+                bld_idx_orig = buildings.index[pos_idx]
+                dir_info = _building_directions.get(bld_idx_orig)
+                if dir_info is None or dir_info.get("source") not in ("address", "driveway"):
+                    continue
+
+                bld_geom_m = buildings_m_pp.iloc[pos_idx].geometry
+                nearby_addrs = list(addrs_m_pp.sindex.query(bld_geom_m.buffer(5), predicate=None))
+                matched_street = None
+                for ap in nearby_addrs:
+                    aw = address_polygons.iloc[ap]
+                    sn = aw.get("addr:street", None)
+                    if isinstance(sn, str) and sn.strip().lower() in street_road_geoms:
+                        matched_street = sn.strip().lower()
+                        break
+                if matched_street is None:
+                    continue
+
+                seg_list = street_road_geoms[matched_street]
+
+                # Distance from each pin to the matched street (in metres)
+                bld_cent = buildings_m_pp.iloc[pos_idx].geometry.centroid
+                cos_r = np.cos(np.radians(center_lat))
+                def _pin_m(plat, plon):
+                    """Approximate metres offset from projected building centroid."""
+                    dx = (plon - buildings.iloc[pos_idx].geometry.centroid.x) * 111320 * cos_r
+                    dy = (plat - buildings.iloc[pos_idx].geometry.centroid.y) * 111320
+                    return Point(bld_cent.x + dx, bld_cent.y + dy)
+
+                fp_m = _pin_m(cur_fp.lat, cur_fp.lon)
+                bp_m = _pin_m(cur_bp.lat, cur_bp.lon)
+
+                # Each pin finds its own nearest segment of the address
+                # road.  The pin closer to any segment is "front".
+                fd = min(fp_m.distance(seg) for seg in seg_list)
+                bd = min(bp_m.distance(seg) for seg in seg_list)
+
+                if fd > bd * 1.05:
+                    cur_fp.garden_type = "back"
+                    cur_bp.garden_type = "front"
+                    addr_road_fixed += 1
+                    addr_road_fixed_bids.add(bid)
+
+            del roads_m_pp, buildings_m_pp, addrs_m_pp
+
+        if show_progress and addr_road_fixed > 0:
+            print(f"    Address-road distance fix: {addr_road_fixed} buildings corrected")
+
+        # ---- POST-PROCESSING: Neighbor consistency (conservative) ----
+        # Only fix buildings that weren't already corrected by the
+        # address-road fix.  Requires unanimous neighbor disagreement.
+        cos_lat = np.cos(np.radians(center_lat))
+        bld_front_dirs = {}
+        bld_centroids_nc = {}
+        for bid, bpins in pins_by_bld.items():
+            pa, pb = bpins.get("front"), bpins.get("back")
+            if pa is None or pb is None:
+                continue
+            fp_nc = pa if pa.garden_type == "front" else pb
+            bp_nc = pb if pa.garden_type == "front" else pa
+            if fp_nc.score == 0 or bp_nc.score == 0:
+                continue
+            dx = (fp_nc.lon - bp_nc.lon) * cos_lat
+            dy = fp_nc.lat - bp_nc.lat
+            length = np.sqrt(dx**2 + dy**2)
+            if length > 1e-9:
+                bld_front_dirs[bid] = (dx / length, dy / length)
+                bld_centroids_nc[bid] = ((fp_nc.lat + bp_nc.lat) / 2, (fp_nc.lon + bp_nc.lon) / 2)
+
+        neighbor_fixed = 0
+        for bid, d in list(bld_front_dirs.items()):
+            if bid in addr_road_fixed_bids:
+                continue
+            clat_nc, clon_nc = bld_centroids_nc[bid]
+            agree = 0
+            disagree = 0
+            for nbid, nd in bld_front_dirs.items():
+                if nbid == bid:
+                    continue
+                nlat, nlon = bld_centroids_nc[nbid]
+                dist = np.sqrt(((clat_nc - nlat) * 111320)**2 + ((clon_nc - nlon) * 111320 * cos_lat)**2)
+                if dist > 20:
+                    continue
+                dot = d[0] * nd[0] + d[1] * nd[1]
+                if dot > 0:
+                    agree += 1
+                else:
+                    disagree += 1
+
+            if disagree >= 2 and agree == 0:
+                pa = pins_by_bld[bid].get("front")
+                pb = pins_by_bld[bid].get("back")
+                if pa is not None and pb is not None:
+                    if pa.garden_type == "front":
+                        pa.garden_type = "back"
+                        pb.garden_type = "front"
+                    else:
+                        pa.garden_type = "front"
+                        pb.garden_type = "back"
+                    bld_front_dirs[bid] = (-d[0], -d[1])
+                    neighbor_fixed += 1
+
+        if show_progress and neighbor_fixed > 0:
+            print(f"    Neighbor consistency fix: {neighbor_fixed} buildings corrected")
 
         if show_progress:
             # Report attempt distribution
@@ -715,8 +1014,17 @@ class PrecomputeManager:
         lat: float,
         lon: float
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-        """Get front and back garden pins for the building nearest to a coordinate."""
-        # Search for any cached area containing this point
+        """Get front and back garden pins for the building nearest to a coordinate.
+
+        Searches ALL cached areas (regardless of zoom level) that contain
+        the point.  When multiple areas match, prefers the smallest area
+        (highest resolution).  Groups pins by building_id and returns the
+        paired front+back from the single nearest building, so both pins
+        always belong to the same property.
+        """
+        # Collect every cached area that contains the query point,
+        # sorted by radius ascending so we try the highest-resolution first.
+        matching: list[tuple[float, str, dict]] = []
         for key, info in self.index.items():
             cached_lat = info.get("lat", 0)
             cached_lon = info.get("lon", 0)
@@ -724,30 +1032,59 @@ class PrecomputeManager:
 
             dist = self._haversine_distance(lat, lon, cached_lat, cached_lon)
             if dist <= cached_radius:
-                cache_path = self._get_area_cache_path(key)
-                if cache_path.exists():
-                    try:
-                        with open(cache_path, "rb") as f:
-                            precomputed = pickle.load(f)
+                matching.append((cached_radius, key, info))
 
-                        best_front = None
-                        best_back = None
-                        min_front_dist = float("inf")
-                        min_back_dist = float("inf")
+        if not matching:
+            print(f"    Precompute cache: ({lat:.5f}, {lon:.5f}) not inside any cached area")
+            return {"front": None, "back": None}
 
-                        for pin in precomputed.delivery_pins:
-                            d = self._haversine_distance(lat, lon, pin["lat"], pin["lon"])
-                            if pin["garden_type"] == "front" and d < min_front_dist:
-                                min_front_dist = d
-                                best_front = pin
-                            elif pin["garden_type"] == "back" and d < min_back_dist:
-                                min_back_dist = d
-                                best_back = pin
+        matching.sort(key=lambda t: t[0])
 
-                        return {"front": best_front, "back": best_back}
-                    except Exception:
+        for cached_radius, key, info in matching:
+            cache_path = self._get_area_cache_path(key)
+            if not cache_path.exists():
+                continue
+            try:
+                with open(cache_path, "rb") as f:
+                    precomputed = pickle.load(f)
+
+                # Group pins by building
+                buildings_map: Dict[str, Dict[str, Any]] = {}
+                for pin in precomputed.delivery_pins:
+                    bid = pin.get("building_id")
+                    if bid is None:
                         continue
+                    if bid not in buildings_map:
+                        buildings_map[bid] = {}
+                    buildings_map[bid][pin["garden_type"]] = pin
 
+                # Find the building whose centroid is closest
+                best_bid = None
+                best_dist = float("inf")
+                for bid, bpins in buildings_map.items():
+                    lats = [p["lat"] for p in bpins.values()]
+                    lons = [p["lon"] for p in bpins.values()]
+                    clat = sum(lats) / len(lats)
+                    clon = sum(lons) / len(lons)
+                    d = self._haversine_distance(lat, lon, clat, clon)
+                    if d < best_dist:
+                        best_dist = d
+                        best_bid = bid
+
+                if best_bid is not None:
+                    bpins = buildings_map[best_bid]
+                    print(f"    Precompute cache hit: ({lat:.5f}, {lon:.5f}) → "
+                          f"area r={cached_radius:.0f}m, zoom={getattr(precomputed, 'zoom', '?')}, "
+                          f"nearest building {best_bid} ({best_dist:.1f}m away)")
+                    return {
+                        "front": bpins.get("front"),
+                        "back": bpins.get("back"),
+                    }
+            except Exception:
+                continue
+
+        print(f"    Precompute cache: ({lat:.5f}, {lon:.5f}) inside {len(matching)} area(s) "
+              f"but no building pins found")
         return {"front": None, "back": None}
 
     def classify_point(self, lat: float, lon: float) -> Dict[str, Any]:

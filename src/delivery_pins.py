@@ -532,6 +532,15 @@ class DeliveryPinFinder:
         del nearest_labels
         _gc.collect()
         
+        # Distance from each pixel to the nearest ownership boundary.
+        # Used to push pins away from property edges (where hedges grow).
+        owner_arr = self.building_owner
+        edge_mask = np.zeros((height, width), dtype=np.uint8)
+        edge_mask[1:, :] |= (owner_arr[1:, :] != owner_arr[:-1, :]).view(np.uint8)
+        edge_mask[:, 1:] |= (owner_arr[:, 1:] != owner_arr[:, :-1]).view(np.uint8)
+        self._owner_edge_dist = distance_transform_edt(edge_mask == 0).astype(np.float32)
+        del edge_mask
+
         print(f"    Building ownership map ({len(self.buildings)} buildings) ({_time.time()-t0:.1f}s)")
     
     def _pixel_to_geo(self, px: int, py: int) -> Tuple[float, float]:
@@ -648,7 +657,8 @@ class DeliveryPinFinder:
     def find_best_pin_for_building(
         self,
         building_idx: int,
-        garden_type: str = "front"
+        garden_type: str = "front",
+        exclude_direction: Optional[Tuple[float, float]] = None
     ) -> Optional[DeliveryPin]:
         """
         Find the best delivery pin for a specific building.
@@ -659,6 +669,10 @@ class DeliveryPinFinder:
         Args:
             building_idx: Index of the building in self.buildings
             garden_type: "front" or "back"
+            exclude_direction: Optional (dx, dy) pixel-space direction vector.
+                Candidates whose vector from building centroid has a positive
+                dot product with this direction are excluded.  Used to force
+                a pin to the opposite side of a previously placed pin.
             
         Returns:
             DeliveryPin or None if no suitable location found
@@ -745,10 +759,12 @@ class DeliveryPinFinder:
             (~claimed_region)
         )
         
-        # No per-building direction filter.  The classification mask already
-        # has correct per-pixel front/back labels (computed from each pixel's
-        # own nearest road geometry), so we trust it entirely.  Per-building
-        # directions are unreliable when the nearest road is a back road.
+        # Opposite-side enforcement: exclude the half-plane containing
+        # a previously placed pin so the new pin lands on the other side.
+        if exclude_direction is not None:
+            ed_x, ed_y = float(exclude_direction[0]), float(exclude_direction[1])
+            dot_map = xs_rel * ed_x + ys_rel * ed_y
+            base_spatial = base_spatial & (dot_map <= 0)
         
         # Property zone constraint
         property_mask = np.ones_like(base_spatial)
@@ -760,13 +776,18 @@ class DeliveryPinFinder:
             else:
                 return None
         
-        # Road-side vegetation filter: ONLY remove vegetation near roads that is
-        # also FAR from buildings (street trees, not front garden grass)
+        # Road-side vegetation filter: remove vegetation that is closer to
+        # a road than to the building — likely street trees, hedge borders
+        # along footpaths, or roadside planting rather than garden grass.
+        # A minimum building distance of 4m protects front garden grass
+        # that is naturally between the house and the road.
         region_road_dist = self.distance_to_road[min_y:max_y, min_x:max_x]
+        road_dist_m = region_road_dist * self.meters_per_pixel
+        bld_dist_m = region_bld_dist * self.meters_per_pixel
         road_veg_filter = ~(
             (region_veg > 0) &
-            (region_road_dist * self.meters_per_pixel < 3) &
-            (region_bld_dist * self.meters_per_pixel > 8)
+            (road_dist_m < bld_dist_m) &
+            (bld_dist_m > 4)
         )
         
         # ---- FALLBACK SYSTEM (tracks which attempt succeeds) ----
@@ -865,6 +886,12 @@ class DeliveryPinFinder:
             dist_road = self.distance_to_road[py_abs, px_abs] * self.meters_per_pixel
             if dist_road < 2:
                 scores[i] -= 10
+            
+            # Property boundary penalty: push pins away from ownership
+            # edges where hedges/fences typically grow
+            edge_dist_m = self._owner_edge_dist[py_abs, px_abs] * self.meters_per_pixel
+            if edge_dist_m < 1.5:
+                scores[i] -= min(15, (1.5 - edge_dist_m) * 10)
             
             # Tree canopy penalty: ONLY for grass candidates.
             # Skipped for large images (arrays are scalar placeholders).
@@ -1174,6 +1201,46 @@ class DeliveryPinFinder:
         back_pin = self._find_pin_for_specific_building(
             building_list_idx, bld_cx, bld_cy, input_px, input_py, "back"
         )
+        
+        # Same-side correction: if both pins are <8m apart, re-search
+        # the lower-scored pin on the opposite side of the building,
+        # then assign labels by road distance (front = closer to road).
+        if front_pin and back_pin and front_pin.score > 0 and back_pin.score > 0:
+            sep_m = np.sqrt(
+                ((front_pin.lat - back_pin.lat) * 111320) ** 2
+                + ((front_pin.lon - back_pin.lon) * 111320 * np.cos(np.radians(self.center_lat))) ** 2
+            )
+            if sep_m < 8:
+                keep, redo_type = (front_pin, "back") if front_pin.score >= back_pin.score else (back_pin, "front")
+                keep_px_meta = keep.metadata.get("pixel_x", None)
+                keep_py_meta = keep.metadata.get("pixel_y", None)
+                if keep_px_meta is not None and keep_py_meta is not None:
+                    exclude_dir = (int(keep_px_meta) - bld_cx, int(keep_py_meta) - bld_cy)
+                    if abs(exclude_dir[0]) >= 1 or abs(exclude_dir[1]) >= 1:
+                        new_pin = self.find_best_pin_for_building(
+                            building_list_idx, redo_type, exclude_direction=exclude_dir
+                        )
+                        if new_pin and new_pin.score > 0:
+                            if redo_type == "front":
+                                front_pin = new_pin
+                            else:
+                                back_pin = new_pin
+
+                        # Assign front/back by road distance
+                        fp_meta = front_pin.metadata.get("pixel_x"), front_pin.metadata.get("pixel_y")
+                        bp_meta = back_pin.metadata.get("pixel_x"), back_pin.metadata.get("pixel_y")
+                        if fp_meta[0] is not None and bp_meta[0] is not None:
+                            h, w = self.classification_mask.shape
+                            fpx = max(0, min(w - 1, int(fp_meta[0])))
+                            fpy = max(0, min(h - 1, int(fp_meta[1])))
+                            bpx = max(0, min(w - 1, int(bp_meta[0])))
+                            bpy = max(0, min(h - 1, int(bp_meta[1])))
+                            f_road = float(self.distance_to_road[fpy, fpx])
+                            b_road = float(self.distance_to_road[bpy, bpx])
+                            if f_road > b_road * 1.05:
+                                front_pin, back_pin = back_pin, front_pin
+                                front_pin.garden_type = "front"
+                                back_pin.garden_type = "back"
         
         return {
             "front": front_pin,
