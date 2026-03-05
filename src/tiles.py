@@ -418,11 +418,13 @@ def meters_to_tiles(meters: float, lat: float, zoom: int) -> int:
 
 
 # Maximum image dimension (width or height) in pixels that we'll attempt to
-# process.  At 33k×33k a single RGB array is 3.4 GB; the full pipeline
-# (HSV, 7 masks, morphology, contours, distance transforms) needs ~15 GB+
-# which causes swap-thrashing on most machines.
-# 10000×10000 ≈ 300 MB RGB → ~2-3 GB peak pipeline → comfortably fits in 8 GB.
-MAX_IMAGE_PIXELS_SIDE = 12_000
+# process.  Memory estimates for the full pipeline (HSV, masks, distance
+# transforms):
+#   ~8k  px (zoom 18, ~750m)  →  ~240 MB RGB  → ~2-3 GB peak  → fine on 8 GB
+#   ~12k px (zoom 18, ~1.1km) →  ~430 MB RGB  → ~4-5 GB peak  → fine on 16 GB
+#   ~17k px (zoom 18, ~3km)   →  ~880 MB RGB  → ~8-10 GB peak → needs 16 GB+
+#   ~34k px (zoom 19, ~3km)   →  ~3.5 GB RGB  → OOM on most machines
+MAX_IMAGE_PIXELS_SIDE = 18_000
 
 
 def recommended_zoom(radius_m: float, lat: float, preferred_zoom: int = None) -> int:
