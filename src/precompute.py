@@ -43,7 +43,9 @@ from src.osm import (
     fetch_address_polygons,
     fetch_property_boundaries,
     geometry_to_pixel_coords,
+    load_osm_from_cache,
     project_to_meters,
+    save_osm_to_cache,
 )
 from src.garden_detector import detect_green_areas, detect_vegetation_enhanced, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
 from src.classifier import GardenClassifier
@@ -222,37 +224,73 @@ class PrecomputeManager:
         if show_progress:
             print(f"    Image: {image_size[0]}x{image_size[1]} ({time.time()-t0:.1f}s)")
 
-        # ---- STEP 2: Fetch OSM data (ONCE) ----
+        # ---- STEP 2: Fetch OSM data (ONCE, with cache) ----
         if show_progress:
             print(f"[2/5] Fetching OSM data...")
         t0 = time.time()
 
-        buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
-        if show_progress:
-            print(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
-        
-        t1 = time.time()
-        roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
-        if show_progress:
-            print(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
-        
-        t1 = time.time()
-        driveways = fetch_driveways(center_lat, center_lon, radius_m, show_progress=False)
+        osm_cached = load_osm_from_cache(center_lat, center_lon, radius_m)
+        if osm_cached is not None:
+            buildings = osm_cached["buildings"]
+            roads = osm_cached["roads"]
+            driveways = osm_cached["driveways"]
+            address_polygons = osm_cached.get("address_polygons", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+            property_boundaries = osm_cached.get("property_boundaries", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+            if show_progress:
+                print(f"    📦 OSM loaded from cache ({len(buildings)} buildings, "
+                      f"{len(roads)} roads, {len(driveways)} driveways, "
+                      f"{len(address_polygons)} addresses, "
+                      f"{len(property_boundaries)} boundaries) ({time.time()-t0:.1f}s)")
+        else:
+            buildings = fetch_buildings(center_lat, center_lon, radius_m, show_progress=False)
+            if show_progress:
+                print(f"    {len(buildings)} buildings ({time.time()-t0:.1f}s)")
+            
+            t1 = time.time()
+            roads = fetch_roads(center_lat, center_lon, radius_m, show_progress=False)
+            if show_progress:
+                print(f"    {len(roads)} roads ({time.time()-t1:.1f}s)")
+            
+            # Driveways, addresses, and boundaries are independent — fetch in parallel
+            t1 = time.time()
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _empty_gdf = lambda: gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
-        try:
-            address_polygons = fetch_address_polygons(center_lat, center_lon, radius_m, show_progress=False)
-        except Exception:
-            address_polygons = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+            def _fetch_driveways():
+                return fetch_driveways(center_lat, center_lon, radius_m, show_progress=False)
 
-        try:
-            property_boundaries = fetch_property_boundaries(center_lat, center_lon, radius_m, show_progress=False)
-        except Exception:
-            property_boundaries = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+            def _fetch_addresses():
+                try:
+                    return fetch_address_polygons(center_lat, center_lon, radius_m, show_progress=False)
+                except Exception:
+                    return _empty_gdf()
 
-        if show_progress:
-            print(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
-                  f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
-            print(f"    OSM total: {time.time()-t0:.1f}s")
+            def _fetch_boundaries():
+                try:
+                    return fetch_property_boundaries(center_lat, center_lon, radius_m, show_progress=False)
+                except Exception:
+                    return _empty_gdf()
+
+            with _TPE(max_workers=3) as pool:
+                fut_d = pool.submit(_fetch_driveways)
+                fut_a = pool.submit(_fetch_addresses)
+                fut_b = pool.submit(_fetch_boundaries)
+                driveways = fut_d.result()
+                address_polygons = fut_a.result()
+                property_boundaries = fut_b.result()
+
+            if show_progress:
+                print(f"    {len(driveways)} driveways, {len(address_polygons)} addresses, "
+                      f"{len(property_boundaries)} boundaries ({time.time()-t1:.1f}s)")
+                print(f"    OSM total: {time.time()-t0:.1f}s")
+
+            save_osm_to_cache({
+                "buildings": buildings,
+                "roads": roads,
+                "driveways": driveways,
+                "address_polygons": address_polygons,
+                "property_boundaries": property_boundaries,
+            }, center_lat, center_lon, radius_m)
 
         if buildings.empty:
             return {
@@ -471,6 +509,19 @@ class PrecomputeManager:
                     metadata={}
                 ))
 
+        # Pre-build building ID → positional index lookup (used by all
+        # post-processing passes, avoids O(n) linear scans per building).
+        bld_id_to_pos: Dict[str, int] = {}
+        for pos_idx in range(len(buildings)):
+            b = buildings.iloc[pos_idx]
+            if "osm_id" in b.index:
+                b_id = str(b["osm_id"])
+            elif hasattr(b, "name") and b.name is not None:
+                b_id = str(b.name)
+            else:
+                b_id = f"bld_{pos_idx}"
+            bld_id_to_pos[b_id] = pos_idx
+
         # ---- POST-PROCESSING: Validate front/back pin placement ----
         # Rule: The front pin MUST be closer to a road than the back pin.
         # If not, swap them.
@@ -573,20 +624,7 @@ class PrecomputeManager:
                 * _h2
             )
 
-            # Find the positional building index for pin_finder
-            bld_pos_idx = None
-            for pos_idx in range(len(buildings)):
-                b = buildings.iloc[pos_idx]
-                b_id = None
-                if "osm_id" in b.index:
-                    b_id = str(b["osm_id"])
-                elif hasattr(b, "name") and b.name is not None:
-                    b_id = str(b.name)
-                else:
-                    b_id = f"bld_{pos_idx}"
-                if b_id == bid:
-                    bld_pos_idx = pos_idx
-                    break
+            bld_pos_idx = bld_id_to_pos.get(bid)
             if bld_pos_idx is None:
                 continue
 
@@ -692,17 +730,6 @@ class PrecomputeManager:
                             street_road_geoms[key] = []
                         street_road_geoms[key].append(roads_m_pp.iloc[ri].geometry)
 
-            bld_id_to_pos = {}
-            for pos_idx in range(len(buildings)):
-                b = buildings.iloc[pos_idx]
-                if "osm_id" in b.index:
-                    b_id = str(b["osm_id"])
-                elif hasattr(b, "name") and b.name is not None:
-                    b_id = str(b.name)
-                else:
-                    b_id = f"bld_{pos_idx}"
-                bld_id_to_pos[b_id] = pos_idx
-
             for bid, bpins in pins_by_bld.items():
                 pin_a = bpins.get("front")
                 pin_b = bpins.get("back")
@@ -768,9 +795,13 @@ class PrecomputeManager:
         # ---- POST-PROCESSING: Neighbor consistency (conservative) ----
         # Only fix buildings that weren't already corrected by the
         # address-road fix.  Requires unanimous neighbor disagreement.
+        # Uses a cKDTree for O(n log n) neighbor lookups instead of O(n^2).
+        from scipy.spatial import cKDTree as _cKDTree
+
         cos_lat = np.cos(np.radians(center_lat))
-        bld_front_dirs = {}
-        bld_centroids_nc = {}
+        nc_bids: list[str] = []
+        nc_dirs: list[tuple[float, float]] = []
+        nc_coords_m: list[tuple[float, float]] = []
         for bid, bpins in pins_by_bld.items():
             pa, pb = bpins.get("front"), bpins.get("back")
             if pa is None or pb is None:
@@ -783,41 +814,46 @@ class PrecomputeManager:
             dy = fp_nc.lat - bp_nc.lat
             length = np.sqrt(dx**2 + dy**2)
             if length > 1e-9:
-                bld_front_dirs[bid] = (dx / length, dy / length)
-                bld_centroids_nc[bid] = ((fp_nc.lat + bp_nc.lat) / 2, (fp_nc.lon + bp_nc.lon) / 2)
+                nc_bids.append(bid)
+                nc_dirs.append((dx / length, dy / length))
+                mid_lat = (fp_nc.lat + bp_nc.lat) / 2
+                mid_lon = (fp_nc.lon + bp_nc.lon) / 2
+                nc_coords_m.append((mid_lat * 111320, mid_lon * 111320 * cos_lat))
 
         neighbor_fixed = 0
-        for bid, d in list(bld_front_dirs.items()):
-            if bid in addr_road_fixed_bids:
-                continue
-            clat_nc, clon_nc = bld_centroids_nc[bid]
-            agree = 0
-            disagree = 0
-            for nbid, nd in bld_front_dirs.items():
-                if nbid == bid:
-                    continue
-                nlat, nlon = bld_centroids_nc[nbid]
-                dist = np.sqrt(((clat_nc - nlat) * 111320)**2 + ((clon_nc - nlon) * 111320 * cos_lat)**2)
-                if dist > 20:
-                    continue
-                dot = d[0] * nd[0] + d[1] * nd[1]
-                if dot > 0:
-                    agree += 1
-                else:
-                    disagree += 1
+        if nc_coords_m:
+            tree = _cKDTree(np.array(nc_coords_m))
+            neighbor_lists = tree.query_ball_tree(tree, r=20.0)
 
-            if disagree >= 2 and agree == 0:
-                pa = pins_by_bld[bid].get("front")
-                pb = pins_by_bld[bid].get("back")
-                if pa is not None and pb is not None:
-                    if pa.garden_type == "front":
-                        pa.garden_type = "back"
-                        pb.garden_type = "front"
+            for i, neighbors in enumerate(neighbor_lists):
+                bid = nc_bids[i]
+                if bid in addr_road_fixed_bids:
+                    continue
+                d = nc_dirs[i]
+                agree = 0
+                disagree = 0
+                for j in neighbors:
+                    if j == i:
+                        continue
+                    nd = nc_dirs[j]
+                    dot = d[0] * nd[0] + d[1] * nd[1]
+                    if dot > 0:
+                        agree += 1
                     else:
-                        pa.garden_type = "front"
-                        pb.garden_type = "back"
-                    bld_front_dirs[bid] = (-d[0], -d[1])
-                    neighbor_fixed += 1
+                        disagree += 1
+
+                if disagree >= 2 and agree == 0:
+                    pa = pins_by_bld[bid].get("front")
+                    pb = pins_by_bld[bid].get("back")
+                    if pa is not None and pb is not None:
+                        if pa.garden_type == "front":
+                            pa.garden_type = "back"
+                            pb.garden_type = "front"
+                        else:
+                            pa.garden_type = "front"
+                            pb.garden_type = "back"
+                        nc_dirs[i] = (-d[0], -d[1])
+                        neighbor_fixed += 1
 
         if show_progress and neighbor_fixed > 0:
             print(f"    Neighbor consistency fix: {neighbor_fixed} buildings corrected")
