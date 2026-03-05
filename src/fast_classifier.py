@@ -36,6 +36,7 @@ from src.osm import (
 from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
 from src.classifier import GardenClassifier
 from src.delivery_pins import DeliveryPinFinder, SurfaceType
+from src.precompute import PrecomputeManager
 
 # Cache directory for fast lookups
 FAST_CACHE_DIR = Path(config.OUTPUT_DIR) / "fast_cache"
@@ -154,7 +155,7 @@ class FastGardenClassifier:
         """
         start_time = time.time()
         
-        # Check cache first
+        # Check fast cache (exact coordinate match)
         if use_cache:
             cached = self._load_from_cache(lat, lon)
             if cached:
@@ -163,10 +164,40 @@ class FastGardenClassifier:
                     "back": cached.back_pin,
                     "metadata": {
                         "from_cache": True,
+                        "cache_source": "fast",
                         "processing_time": cached.processing_time,
                         "cached_at": cached.computed_at
                     }
                 }
+        
+            # Check precompute cache (searches all cached areas at any zoom)
+            try:
+                manager = PrecomputeManager(tile_source=self.tile_source)
+                pins = manager.get_nearest_building_pins(lat, lon)
+                if pins["front"] is not None or pins["back"] is not None:
+                    processing_time = time.time() - start_time
+                    self._save_to_cache(CachedResult(
+                        lat=lat, lon=lon,
+                        front_pin=pins["front"],
+                        back_pin=pins["back"],
+                        classification=pins["front"].get("surface_type", "unknown") if pins["front"] else "unknown",
+                        surface_type=pins["front"].get("surface_type", "unknown") if pins["front"] else "unknown",
+                        score=pins["front"].get("score", 0) if pins["front"] else 0,
+                        distance_to_building_m=pins["front"].get("distance_to_building_m", 0) if pins["front"] else 0,
+                        computed_at=time.time(),
+                        processing_time=processing_time
+                    ))
+                    return {
+                        "front": pins["front"],
+                        "back": pins["back"],
+                        "metadata": {
+                            "from_cache": True,
+                            "cache_source": "precompute",
+                            "processing_time": round(processing_time, 3)
+                        }
+                    }
+            except Exception as e:
+                print(f"    Precompute cache lookup error: {e}")
         
         # Process the location
         try:
