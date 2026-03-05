@@ -31,7 +31,10 @@ Automatically distinguishes **front gardens** (facing the road) from **back gard
 │     └─> One front + one back pin per building                  │
 │     └─> 4-attempt fallback: classified → directional →         │
 │         paved/driveway → relaxed ownership                     │
-│     └─> Tree canopy penalty, claimed-area deduplication        │
+│     └─> Tree canopy penalty, property boundary penalty,        │
+│         claimed-area deduplication                              │
+│     └─> Post-processing: same-side correction,                 │
+│         address-road distance fix, neighbor consistency        │
 ├─────────────────────────────────────────────────────────────────┤
 │  6. Output                                                      │
 │     └─> Segmentation mask, delivery pins, map visualisation    │
@@ -85,13 +88,45 @@ python main.py --demo
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
-| `POST` | `/api/garden-pins` | Get front/back pins for a single address (eircode or GPS) |
+| `POST` | `/api/garden-pins` | Get front/back pins for a single address (lat/lon, coords string, or eircode) |
 | `POST` | `/api/garden-pins/batch` | Get all delivery pins within a radius |
 | `POST` | `/api/classify` | Classify a GPS coordinate as front/back garden |
 | `POST` | `/api/precompute` | Precompute all pins for a large area |
 | `GET` | `/api/cache/stats` | Get cache statistics |
 | `DELETE` | `/api/cache` | Clear all caches |
 | `POST` | `/api/shutdown` | Gracefully stop the server |
+
+### Location input
+
+Both `/api/garden-pins` and `/api/garden-pins/batch` accept coordinates in two forms:
+
+```jsonc
+// Separate fields
+{ "lat": 53.3498, "lon": -6.2603 }
+
+// Single string
+{ "coords": "53.3498, -6.2603" }
+```
+
+The single-pin endpoint also accepts `"eircode": "D15 YXN8"` (geocoded via a 5-strategy cascade: Google Geocoding, Google Places, Nominatim postalcode, Nominatim free-text, routing key approximation).
+
+### Map generation
+
+Both endpoints support `"generate_map": true` to produce a PNG visualization of the pins. The map URL is returned in the response as `map_url` and served from `/static/`.
+
+### Example requests
+
+```bash
+# Single house
+curl -s -X POST "http://localhost:8000/api/garden-pins" \
+  -H "Content-Type: application/json" \
+  -d '{"coords": "53.380365, -6.386601", "generate_map": true}'
+
+# All pins in a 500m radius
+curl -s -X POST "http://localhost:8000/api/garden-pins/batch" \
+  -H "Content-Type: application/json" \
+  -d '{"coords": "53.3498, -6.2603", "radius_m": 500, "generate_map": true}'
+```
 
 ## Batch Precomputation
 
@@ -101,7 +136,7 @@ For processing entire suburbs (hundreds of buildings), use the precompute endpoi
 python batch_precompute.py --lat 53.3917 --lon -6.3878 --radius 500
 ```
 
-This fetches imagery once, classifies the full area, and stores pins for every building. Subsequent API lookups are served from cache.
+This fetches imagery once, classifies the full area, and stores pins for every building. Single-point lookups automatically fall back to the precompute cache when available, so subsequent API calls for any house within a precomputed area are near-instant.
 
 ## Output
 
