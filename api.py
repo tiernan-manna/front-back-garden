@@ -89,9 +89,11 @@ class GardenPinRequest(BaseModel):
     """Request for garden pins at a single location."""
     lat: Optional[float] = Field(None, ge=-90, le=90, description="Latitude")
     lon: Optional[float] = Field(None, ge=-180, le=180, description="Longitude")
+    coords: Optional[str] = Field(None, description="Lat,lon as a string e.g. '53.380365, -6.386601'")
     eircode: Optional[str] = Field(None, description="Irish Eircode (alternative to lat/lon)")
     tile_source: TileSourceEnum = Field(TileSourceEnum.auto, description="Tile source to use")
     skip_cache: bool = Field(False, description="Skip cache and recompute")
+    generate_map: bool = Field(False, description="Generate a visualization map of the pins")
 
 
 class GardenPinResponse(BaseModel):
@@ -99,12 +101,14 @@ class GardenPinResponse(BaseModel):
     front: Optional[Dict[str, Any]] = Field(None, description="Best front garden delivery pin")
     back: Optional[Dict[str, Any]] = Field(None, description="Best back garden delivery pin")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+    map_url: Optional[str] = Field(None, description="URL to visualization map (if generated)")
 
 
 class BatchPinRequest(BaseModel):
     """Request for all garden pins within a radius."""
-    lat: float = Field(..., ge=-90, le=90, description="Center latitude")
-    lon: float = Field(..., ge=-180, le=180, description="Center longitude")
+    lat: Optional[float] = Field(None, ge=-90, le=90, description="Center latitude")
+    lon: Optional[float] = Field(None, ge=-180, le=180, description="Center longitude")
+    coords: Optional[str] = Field(None, description="Lat,lon as a string e.g. '53.3498, -6.2603'")
     radius_m: float = Field(500, ge=10, le=5000, description="Search radius in meters")
     garden_type: Optional[str] = Field(None, description="Filter by 'front' or 'back'")
     min_score: float = Field(0.0, ge=0, le=100, description="Minimum score threshold (0 to include no-garden entries)")
@@ -181,106 +185,171 @@ EIRCODE_ROUTING_COORDS = {
 }
 
 
+def _is_in_ireland(lat: float, lon: float) -> bool:
+    return 51.3 <= lat <= 55.5 and -10.7 <= lon <= -5.3
+
+
+def _routing_key_matches(lat: float, lon: float, routing_key: str) -> bool:
+    """Validate that geocoded coordinates are plausibly near the routing key area."""
+    expected = EIRCODE_ROUTING_COORDS.get(routing_key)
+    if expected is None:
+        return True
+    exp_lat, exp_lon = expected
+    # Routing key areas are roughly 5-10km across; reject if >15km away
+    dlat = abs(lat - exp_lat) * 111_000
+    dlon = abs(lon - exp_lon) * 111_000 * 0.6  # cos(53°) ≈ 0.6
+    return (dlat**2 + dlon**2) ** 0.5 < 15_000
+
+
 async def geocode_eircode(eircode: str) -> Optional[Dict[str, float]]:
     """
     Geocode an Irish Eircode to lat/lon coordinates.
-    
-    Strategy:
-    1. Try Google Geocoding API
-    2. Try Nominatim with full eircode
-    3. Use routing key lookup table for approximate location
-    
-    Args:
-        eircode: Irish Eircode (e.g., "D15 YXN8" or "D15YXN8")
-        
-    Returns:
-        Dict with 'lat' and 'lon' or None if not found
+
+    Strategy (stops at first success):
+    1. Google Geocoding API
+    2. Google Places API (Text Search) — often enabled even when Geocoding isn't
+    3. Nominatim structured postalcode search
+    4. Nominatim free-text with routing key validation
+    5. Routing key lookup table (approximate, always available)
+
+    Every result is validated against the routing key area to prevent
+    cross-Dublin mis-matches (e.g. D15 eircode returning a D02 location).
     """
     import config
-    
-    # Clean up eircode
+
     eircode_clean = eircode.strip().upper().replace(" ", "")
-    
+
     if len(eircode_clean) != 7:
         print(f"Invalid eircode format: {eircode} (should be 7 characters)")
         return None
-    
+
     eircode_formatted = f"{eircode_clean[:3]} {eircode_clean[3:]}"
     routing_key = eircode_clean[:3]
-    
+    nominatim_headers = {"User-Agent": "MannaGardenClassifier/1.0"}
+    google_api_key = getattr(config, "GOOGLE_TILES_API_KEY", None)
+
+    def _make_result(lat, lon, display_name, source):
+        return {"lat": lat, "lon": lon, "display_name": display_name, "source": source}
+
     async with httpx.AsyncClient(timeout=15) as client:
-        # Strategy 1: Google Geocoding API
-        google_api_key = getattr(config, 'GOOGLE_TILES_API_KEY', None)
+
+        # --- Strategy 1: Google Geocoding API ---
         if google_api_key:
             try:
-                url = "https://maps.googleapis.com/maps/api/geocode/json"
-                params = {
-                    "address": f"{eircode_formatted}, Ireland",
-                    "key": google_api_key,
-                    "components": "country:IE"
-                }
-                
-                response = await client.get(url, params=params)
-                data = response.json()
-                
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/geocode/json",
+                    params={
+                        "address": eircode_formatted,
+                        "key": google_api_key,
+                        "region": "ie",
+                        "components": "country:IE|postal_code:" + eircode_clean,
+                    },
+                )
+                data = resp.json()
                 if data.get("status") == "OK" and data.get("results"):
-                    result = data["results"][0]
-                    location = result["geometry"]["location"]
-                    lat, lon = location["lat"], location["lng"]
-                    
-                    if 51 <= lat <= 56 and -11 <= lon <= -5:
-                        return {
-                            "lat": lat,
-                            "lon": lon,
-                            "display_name": result.get("formatted_address", eircode_formatted),
-                            "source": "google"
-                        }
+                    loc = data["results"][0]["geometry"]["location"]
+                    lat, lon = loc["lat"], loc["lng"]
+                    if _is_in_ireland(lat, lon) and _routing_key_matches(lat, lon, routing_key):
+                        print(f"Eircode {eircode_formatted} geocoded via Google Geocoding → ({lat:.6f}, {lon:.6f})")
+                        return _make_result(lat, lon, data["results"][0].get("formatted_address", eircode_formatted), "google")
                 elif data.get("status") == "REQUEST_DENIED":
-                    print(f"Google Geocoding API not enabled. Enable it at: https://console.cloud.google.com/apis/library/geocoding-backend.googleapis.com")
+                    print("Google Geocoding API not enabled — trying Places API next")
             except Exception as e:
-                print(f"Google geocoding error: {e}")
-        
-        # Strategy 2: Nominatim with address search
+                print(f"Google Geocoding error: {e}")
+
+        # --- Strategy 2: Google Places API (Text Search) ---
+        if google_api_key:
+            try:
+                resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+                    params={
+                        "input": f"{eircode_formatted}, Ireland",
+                        "inputtype": "textquery",
+                        "fields": "formatted_address,geometry,name",
+                        "locationbias": "circle:50000@53.4,-6.6",
+                        "key": google_api_key,
+                    },
+                )
+                data = resp.json()
+                if data.get("status") == "OK" and data.get("candidates"):
+                    loc = data["candidates"][0]["geometry"]["location"]
+                    lat, lon = loc["lat"], loc["lng"]
+                    if _is_in_ireland(lat, lon) and _routing_key_matches(lat, lon, routing_key):
+                        name = data["candidates"][0].get("formatted_address", eircode_formatted)
+                        print(f"Eircode {eircode_formatted} geocoded via Google Places → ({lat:.6f}, {lon:.6f})")
+                        return _make_result(lat, lon, name, "google_places")
+                elif data.get("status") == "REQUEST_DENIED":
+                    print("Google Places API also not enabled")
+            except Exception as e:
+                print(f"Google Places error: {e}")
+
+        # --- Strategy 3: Nominatim structured postalcode search ---
         try:
-            url = "https://nominatim.openstreetmap.org/search"
-            # Try searching for eircode as address
-            params = {
-                "q": f"{eircode_formatted} Ireland",
-                "format": "json",
-                "countrycodes": "ie",
-                "limit": 5
-            }
-            headers = {"User-Agent": "MannaGardenClassifier/1.0"}
-            
-            response = await client.get(url, params=params, headers=headers)
-            results = response.json()
-            
-            # Find result that's actually in Ireland
-            for result in results:
-                lat = float(result["lat"])
-                lon = float(result["lon"])
-                if 51 <= lat <= 56 and -11 <= lon <= -5:
-                    return {
-                        "lat": lat,
-                        "lon": lon,
-                        "display_name": result.get("display_name", ""),
-                        "source": "nominatim"
-                    }
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "postalcode": eircode_formatted,
+                    "country": "Ireland",
+                    "format": "json",
+                    "limit": 5,
+                    "addressdetails": 1,
+                },
+                headers=nominatim_headers,
+            )
+            for result in resp.json():
+                lat, lon = float(result["lat"]), float(result["lon"])
+                if _is_in_ireland(lat, lon) and _routing_key_matches(lat, lon, routing_key):
+                    print(f"Eircode {eircode_formatted} geocoded via Nominatim (postalcode) → ({lat:.6f}, {lon:.6f})")
+                    return _make_result(lat, lon, result.get("display_name", ""), "nominatim")
         except Exception as e:
-            print(f"Nominatim lookup failed: {e}")
-    
-    # Strategy 3: Use routing key lookup for approximate location
+            print(f"Nominatim postalcode lookup failed: {e}")
+
+        # --- Strategy 4: Nominatim free-text with routing key constraint ---
+        try:
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": eircode_formatted,
+                    "format": "json",
+                    "countrycodes": "ie",
+                    "limit": 10,
+                    "addressdetails": 1,
+                },
+                headers=nominatim_headers,
+            )
+            for result in resp.json():
+                lat, lon = float(result["lat"]), float(result["lon"])
+                if _is_in_ireland(lat, lon) and _routing_key_matches(lat, lon, routing_key):
+                    print(f"Eircode {eircode_formatted} geocoded via Nominatim (text) → ({lat:.6f}, {lon:.6f})")
+                    return _make_result(lat, lon, result.get("display_name", ""), "nominatim")
+            if resp.json():
+                print(
+                    f"Nominatim returned results for {eircode_formatted} but none matched "
+                    f"routing key {routing_key} area — skipping bad matches"
+                )
+        except Exception as e:
+            print(f"Nominatim text lookup failed: {e}")
+
+    # --- Strategy 5: Routing key approximation (always works for known keys) ---
     if routing_key in EIRCODE_ROUTING_COORDS:
         lat, lon = EIRCODE_ROUTING_COORDS[routing_key]
-        print(f"Using routing key approximation for {eircode}")
+        print(f"Eircode {eircode_formatted}: all geocoding APIs failed, using routing key {routing_key} approximation → ({lat:.6f}, {lon:.6f})")
+        apis_needed = []
+        if google_api_key:
+            apis_needed.append("Enable Google Geocoding API: https://console.cloud.google.com/apis/library/geocoding-backend.googleapis.com")
+            apis_needed.append("Or enable Places API: https://console.cloud.google.com/apis/library/places-backend.googleapis.com")
+        else:
+            apis_needed.append("Set GOOGLE_TILES_API_KEY in config and enable Geocoding API")
+        for msg in apis_needed:
+            print(f"  → {msg}")
         return {
             "lat": lat,
             "lon": lon,
-            "display_name": f"{routing_key} area, Dublin, Ireland (approximate)",
+            "display_name": f"{routing_key} area, Ireland (approximate)",
             "source": "routing_key",
-            "approximate": True
+            "approximate": True,
         }
-    
+
     print(f"Could not geocode eircode: {eircode}")
     return None
 
@@ -589,8 +658,13 @@ async def get_garden_pins(request: GardenPinRequest):
     lat, lon = None, None
     geocode_info = None
     
-    if request.eircode:
-        # Geocode eircode (async)
+    if request.coords:
+        try:
+            parts = [p.strip() for p in request.coords.split(",")]
+            lat, lon = float(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail=f"Invalid coords format: '{request.coords}'. Use 'lat, lon' e.g. '53.380365, -6.386601'")
+    elif request.eircode:
         geocode_result = await geocode_eircode(request.eircode)
         if geocode_result is None:
             raise HTTPException(
@@ -633,10 +707,21 @@ async def get_garden_pins(request: GardenPinRequest):
         if geocode_info:
             metadata["geocoded_address"] = geocode_info
     
+    map_url = None
+    if request.generate_map:
+        pins = [p for p in [result.get("front"), result.get("back")] if p]
+        if pins:
+            map_filename = await run_in_executor(
+                generate_pins_map, pins, lat, lon, 50
+            )
+            if map_filename:
+                map_url = f"/static/{map_filename}"
+    
     return GardenPinResponse(
         front=result.get("front"),
         back=result.get("back"),
-        metadata=metadata
+        metadata=metadata,
+        map_url=map_url
     )
 
 
@@ -657,17 +742,27 @@ async def get_garden_pins_batch(request: BatchPinRequest):
     """
     start_time = time.time()
     
+    lat, lon = request.lat, request.lon
+    if request.coords:
+        try:
+            parts = [p.strip() for p in request.coords.split(",")]
+            lat, lon = float(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail=f"Invalid coords format: '{request.coords}'. Use 'lat, lon' e.g. '53.3498, -6.2603'")
+    if lat is None or lon is None:
+        raise HTTPException(status_code=400, detail="Provide either 'lat'+'lon' or 'coords'")
+    
     tile_source = get_tile_source(request.tile_source)
     manager = PrecomputeManager(tile_source=tile_source)
     
     # Check if area is precomputed
-    is_cached = manager.is_area_cached(request.lat, request.lon, request.radius_m)
+    is_cached = manager.is_area_cached(lat, lon, request.radius_m)
     
     # Run in thread pool
     pins = await run_in_executor(
         manager.get_pins_in_radius,
-        request.lat,
-        request.lon,
+        lat,
+        lon,
         request.radius_m,
         request.garden_type,
         request.min_score
@@ -681,8 +776,8 @@ async def get_garden_pins_batch(request: BatchPinRequest):
         map_filename = await run_in_executor(
             generate_pins_map,
             pins,
-            request.lat,
-            request.lon,
+            lat,
+            lon,
             request.radius_m
         )
         if map_filename:
@@ -695,8 +790,8 @@ async def get_garden_pins_batch(request: BatchPinRequest):
         pins=pins,
         count=len(pins),
         metadata={
-            "center_lat": request.lat,
-            "center_lon": request.lon,
+            "center_lat": lat,
+            "center_lon": lon,
             "radius_m": request.radius_m,
             "garden_type": request.garden_type,
             "min_score": request.min_score,
