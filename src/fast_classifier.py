@@ -33,7 +33,7 @@ from src.osm import (
     OSM_CACHE_DIR, get_osm_cache_key, fetch_buildings, fetch_roads, fetch_driveways,
     fetch_address_polygons, fetch_property_boundaries
 )
-from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
+from src.garden_detector import detect_green_areas, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture, recover_shaded_grass
 from src.classifier import GardenClassifier
 from src.delivery_pins import DeliveryPinFinder, SurfaceType
 from src.precompute import PrecomputeManager
@@ -354,6 +354,12 @@ class FastGardenClassifier:
         grass_mask, tree_mask = split_vegetation_by_texture(
             image, vegetation_mask,
             building_polys_px=building_polys_px,
+            meters_per_pixel=mpp
+        )
+        
+        grass_mask = recover_shaded_grass(
+            image, grass_mask, tree_mask,
+            building_polys_px, road_lines_px,
             meters_per_pixel=mpp
         )
         

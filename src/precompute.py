@@ -47,7 +47,7 @@ from src.osm import (
     project_to_meters,
     save_osm_to_cache,
 )
-from src.garden_detector import detect_green_areas, detect_vegetation_enhanced, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture
+from src.garden_detector import detect_green_areas, detect_vegetation_enhanced, exclude_buildings_from_mask, exclude_roads_from_mask, split_vegetation_by_texture, recover_shaded_grass
 from src.classifier import GardenClassifier
 from src.delivery_pins import DeliveryPinFinder, DeliveryPin
 
@@ -346,6 +346,12 @@ class PrecomputeManager:
         grass_mask, tree_mask = split_vegetation_by_texture(
             image, vegetation_mask,
             building_polys_px=building_polys_px,
+            meters_per_pixel=mpp
+        )
+
+        grass_mask = recover_shaded_grass(
+            image, grass_mask, tree_mask,
+            building_polys_px, road_lines_px,
             meters_per_pixel=mpp
         )
 

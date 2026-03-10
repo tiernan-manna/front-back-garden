@@ -389,16 +389,39 @@ class DeliveryPinFinder:
         else:
             self._tree_fraction = np.zeros(1, dtype=np.float32)  # scalar placeholder
         
-        # Shade recovery: non-vegetation pixels that are surrounded by grass
-        # are likely shaded sections of the same garden (building/tree shadow),
-        # not actual paved surfaces.  Uses the large-scale grass density map.
+        # Shade recovery: non-vegetation pixels that are likely grass in shadow.
+        # When buildings cast shadow on front gardens (common in morning/evening
+        # imagery), entire rows of gardens can be missed by green detection.
+        #
+        # Key improvement: compute vegetation ratio among GARDEN-LIKE pixels
+        # only (exclude buildings and roads from the denominator).  A small
+        # front garden squeezed between a building and a road would show near-
+        # zero density with a naive average, but high density when only
+        # garden-like pixels are counted.  A wider window (51px ≈ 15m) lets
+        # the search reach sunlit back gardens behind the building.
+        shade_window = 51 if not large_image else 31
+        garden_area_f = ((self.building_mask == 0) & (self.road_mask == 0)).astype(np.float32)
+        veg_in_garden = veg_binary * garden_area_f
+        shade_num = uniform_filter(veg_in_garden, size=shade_window).astype(np.float32)
+        shade_den = uniform_filter(garden_area_f, size=shade_window).astype(np.float32)
+        del veg_in_garden, garden_area_f
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            shade_veg_ratio = np.where(
+                shade_den > 0.01, shade_num / shade_den, 0.0
+            ).astype(np.float32)
+        del shade_num, shade_den
+        
+        max_bld_dist_px = 15.0 / self.meters_per_pixel
         self._shade_recovered = (
             (~(self.vegetation_mask > 0)) &
-            (self._green_density_large > 0.25) &
+            (shade_veg_ratio > 0.15) &
+            (self.distance_to_building < max_bld_dist_px) &
             (self.building_mask == 0) &
             (self.road_mask == 0) &
             (self.driveway_mask == 0)
         )
+        del shade_veg_ratio
         shade_count = int(np.sum(self._shade_recovered))
         
         total_components = num_labels - 1

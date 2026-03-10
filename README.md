@@ -19,6 +19,7 @@ Automatically distinguishes **front gardens** (facing the road) from **back gard
 │  3. Vegetation Detection (OpenCV + Excess Green Index)         │
 │     └─> HSV colour segmentation + ExG confirmation             │
 │     └─> Texture-based grass/tree canopy separation             │
+│     └─> Image-based shade recovery (greenish hue + weak ExG)  │
 ├─────────────────────────────────────────────────────────────────┤
 │  4. Geometric Classification                                    │
 │     └─> STRtree spatial indexes for O(log n) road/driveway     │
@@ -31,8 +32,10 @@ Automatically distinguishes **front gardens** (facing the road) from **back gard
 │     └─> One front + one back pin per building                  │
 │     └─> 4-attempt fallback: classified → directional →         │
 │         paved/driveway → relaxed ownership                     │
-│     └─> Tree canopy penalty, property boundary penalty,        │
-│         claimed-area deduplication                              │
+│     └─> Property border enforcement (configurable width)       │
+│     └─> Lateral corridor constraint (building-width aligned)   │
+│     └─> Tree canopy penalty, boundary penalty,                 │
+│         claimed-area deduplication, shade recovery             │
 │     └─> Post-processing: same-side correction,                 │
 │         address-road distance fix, neighbor consistency        │
 ├─────────────────────────────────────────────────────────────────┤
@@ -170,6 +173,9 @@ ZOOM_LEVEL = 19  # 18-20 recommended (auto-reduced for large radii)
 # Green detection thresholds (HSV)
 GREEN_HSV_LOWER = (35, 25, 25)
 GREEN_HSV_UPPER = (85, 255, 255)
+
+# Property border width (meters) — pins stay outside this zone
+PROPERTY_BORDER_WIDTH_M = 3.0
 ```
 
 ## Project Structure
@@ -214,6 +220,7 @@ May struggle with:
 - Apartment complexes
 - Properties with unusual layouts
 - Very dense tree canopy obscuring ground
+- Fully shaded gardens with no greenish hue remaining
 
 ## License
 

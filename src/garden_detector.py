@@ -243,6 +243,86 @@ def split_vegetation_by_texture(
     return grass_mask, tree_mask
 
 
+def recover_shaded_grass(
+    image: np.ndarray,
+    grass_mask: np.ndarray,
+    tree_mask: np.ndarray,
+    building_polys_px: List[List[Tuple[int, int]]],
+    road_lines_px: List[List[Tuple[int, int]]],
+    meters_per_pixel: float = 0.3
+) -> np.ndarray:
+    """
+    Recover grass pixels lost to shadow during HSV/ExG detection.
+    
+    In shadow, grass retains a greenish hue but its brightness drops
+    below standard detection thresholds (ExG > 0.1).  This function
+    uses the actual image colors -- weak positive ExG plus greenish
+    hue -- to recover shaded grass without false-positiving on genuinely
+    paved surfaces (which have neutral or warm hues).
+    
+    Must be called while the image is still available (before it is freed).
+    """
+    from scipy.ndimage import distance_transform_edt, uniform_filter
+    
+    h, w = grass_mask.shape
+    
+    bld_mask = np.zeros((h, w), dtype=np.uint8)
+    for poly in building_polys_px:
+        if poly and len(poly) >= 3:
+            pts = np.array(poly, dtype=np.int32)
+            cv2.fillPoly(bld_mask, [pts], 255)
+    
+    road_mask = np.zeros((h, w), dtype=np.uint8)
+    for rline in road_lines_px:
+        if rline and len(rline) >= 2:
+            pts = np.array(rline, dtype=np.int32)
+            cv2.polylines(road_mask, [pts], False, 255, thickness=8)
+    
+    bld_dist_px = distance_transform_edt(bld_mask == 0)
+    max_dist_px = 15.0 / meters_per_pixel
+    
+    img_f = image.astype(np.float32) / 255.0
+    exg = 2 * img_f[:, :, 1] - img_f[:, :, 0] - img_f[:, :, 2]
+    del img_f
+    
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0]
+    green_hue = (hue >= 20) & (hue <= 105)
+    del hsv, hue
+    
+    # Vegetation ratio among garden-like pixels (buildings/roads excluded
+    # from denominator so small gardens aren't diluted)
+    garden_f = ((bld_mask == 0) & (road_mask == 0)).astype(np.float32)
+    veg_f = (grass_mask > 0).astype(np.float32) * garden_f
+    veg_num = uniform_filter(veg_f, size=51).astype(np.float32)
+    veg_den = uniform_filter(garden_f, size=51).astype(np.float32)
+    del veg_f, garden_f
+    with np.errstate(divide='ignore', invalid='ignore'):
+        veg_ratio = np.where(veg_den > 0.01, veg_num / veg_den, 0.0)
+    del veg_num, veg_den
+    
+    recovery = (
+        (grass_mask == 0) &
+        (tree_mask == 0) &
+        (exg > 0.005) &
+        green_hue &
+        (bld_dist_px < max_dist_px) &
+        (bld_mask == 0) &
+        (road_mask == 0) &
+        (veg_ratio > 0.08)
+    )
+    del exg, green_hue, bld_dist_px, bld_mask, road_mask, veg_ratio
+    
+    recovered = int(np.sum(recovery))
+    if recovered > 0:
+        result = grass_mask.copy()
+        result[recovery] = 255
+        print(f"    Shade recovery (image): {recovered:,} grass pixels recovered from shadow")
+        return result
+    
+    return grass_mask
+
+
 def fill_holes(mask: np.ndarray) -> np.ndarray:
     """
     Fill holes within regions of a binary mask.
