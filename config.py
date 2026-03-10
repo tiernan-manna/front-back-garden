@@ -69,6 +69,11 @@ GREEN_HSV_UPPER = (85, 255, 255)
 # Minimum area (in pixels) to consider as a garden
 MIN_GARDEN_AREA_PX = 100
 
+# Minimum border width between adjacent houses (meters).
+# Pins cannot be placed within half this distance of a property boundary edge.
+# This prevents pins from landing in the border zone between houses.
+PROPERTY_BORDER_WIDTH_M = 3.0
+
 # =============================================================================
 # OUTPUT SETTINGS
 # =============================================================================

@@ -22,6 +22,7 @@ from shapely.geometry import Point, Polygon
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
 
+import config
 from src.osm import project_to_meters, geo_to_pixel
 
 
@@ -388,9 +389,23 @@ class DeliveryPinFinder:
         else:
             self._tree_fraction = np.zeros(1, dtype=np.float32)  # scalar placeholder
         
+        # Shade recovery: non-vegetation pixels that are surrounded by grass
+        # are likely shaded sections of the same garden (building/tree shadow),
+        # not actual paved surfaces.  Uses the large-scale grass density map.
+        self._shade_recovered = (
+            (~(self.vegetation_mask > 0)) &
+            (self._green_density_large > 0.25) &
+            (self.building_mask == 0) &
+            (self.road_mask == 0) &
+            (self.driveway_mask == 0)
+        )
+        shade_count = int(np.sum(self._shade_recovered))
+        
         total_components = num_labels - 1
         large_components = int(np.sum(self._large_enough)) - (1 if self._large_enough[0] else 0)
         print(f"    Grass components: {total_components} total, {large_components} >= 5m² (trees filtered by texture)")
+        if shade_count > 0:
+            print(f"    Shade recovery: {shade_count:,} pixels recovered as grass")
     
     def _get_building_centroid_geo(self, building_idx: int) -> Tuple[float, float]:
         """Get geographic centroid (lat, lon) of a building by its list index."""
@@ -429,7 +444,10 @@ class DeliveryPinFinder:
         barrier = np.maximum(barrier, self.road_mask)
         barrier = np.maximum(barrier, self.driveway_mask)
         
-        # Add property boundaries (fences, walls, hedges) from OSM
+        # Add property boundaries (fences, walls, hedges) from OSM.
+        # Barrier thickness derived from configured border width so that
+        # the zone segmentation respects the inter-house border.
+        boundary_thickness_px = max(3, int(config.PROPERTY_BORDER_WIDTH_M / self.meters_per_pixel))
         boundary_count = 0
         if self.property_boundaries is not None and not self.property_boundaries.empty:
             for _, boundary in self.property_boundaries.iterrows():
@@ -443,13 +461,13 @@ class DeliveryPinFinder:
                             coords = geometry_to_pixel_coords(line, self.geo_bounds, self.image_size)
                             if coords and len(coords) >= 2:
                                 pts = np.array(coords, dtype=np.int32)
-                                cv2.polylines(barrier, [pts], False, 255, thickness=3)
+                                cv2.polylines(barrier, [pts], False, 255, thickness=boundary_thickness_px)
                                 boundary_count += 1
                     elif geom.geom_type in ('Polygon', 'MultiPolygon'):
                         coords = geometry_to_pixel_coords(geom, self.geo_bounds, self.image_size)
                         if coords and len(coords) >= 3:
                             pts = np.array(coords, dtype=np.int32)
-                            cv2.polylines(barrier, [pts], True, 255, thickness=3)
+                            cv2.polylines(barrier, [pts], True, 255, thickness=boundary_thickness_px)
                             boundary_count += 1
                 except Exception:
                     continue
@@ -574,15 +592,18 @@ class DeliveryPinFinder:
         if self.vegetation_mask[py, px] > 0:
             return SurfaceType.GRASS
         
+        # Shade recovery: pixel not in vegetation mask but surrounded by grass
+        # is likely a shaded patch of the same garden, not paving
+        if hasattr(self, '_shade_recovered') and self._shade_recovered[py, px]:
+            return SurfaceType.GRASS
+        
         # Non-vegetation areas - check if it might be a paved driveway/patio
         # by looking at distance to driveway or building
         dist_to_building = self.distance_to_building[py, px] * self.meters_per_pixel
         
         if dist_to_building < 5:
-            # Very close to building - might be patio or parking
             return SurfaceType.CAR_PARKING
         
-        # Default to paved for non-vegetation areas
         return SurfaceType.PAVED
     
     def _calculate_score(
@@ -749,14 +770,59 @@ class DeliveryPinFinder:
         claimed_region = (self._claimed_front if garden_type == "front"
                           else self._claimed_back)[min_y:max_y, min_x:max_x]
         
+        # Property border exclusion: hard constraint preventing pins from
+        # being placed within the border zone between adjacent houses
+        border_half_m = config.PROPERTY_BORDER_WIDTH_M / 2
+        region_edge_dist_m = self._owner_edge_dist[min_y:max_y, min_x:max_x] * self.meters_per_pixel
+        border_ok = region_edge_dist_m >= border_half_m
+        
+        # Lateral corridor constraint: restrict pins to within the building's
+        # width (perpendicular to road direction) plus a small tolerance.
+        # This prevents pins from drifting sideways into a neighbor's garden,
+        # which the Voronoi ownership alone cannot reliably prevent.
+        lateral_ok = np.ones((max_y - min_y, max_x - min_x), dtype=bool)
+        dir_info = self.building_directions.get(building_idx_original)
+        if dir_info is not None:
+            road_dir = dir_info.get("direction_to_road")
+            if road_dir is not None:
+                try:
+                    rd_x, rd_y = float(road_dir[0]), float(road_dir[1])
+                    if rd_x * rd_x + rd_y * rd_y > 0.01:
+                        lat_px_x, lat_px_y = -rd_y, -rd_x
+                        
+                        building_poly = self._geometry_to_pixel_polygon(building.geometry)
+                        if building_poly is not None:
+                            coords = list(building_poly.exterior.coords)
+                            lateral_projs = [
+                                (c[0] - bld_cx) * lat_px_x + (c[1] - bld_cy) * lat_px_y
+                                for c in coords
+                            ]
+                            min_lat = min(lateral_projs)
+                            max_lat = max(lateral_projs)
+                            
+                            corridor_tolerance_px = 3.0 / self.meters_per_pixel
+                            min_lat -= corridor_tolerance_px
+                            max_lat += corridor_tolerance_px
+                            
+                            pixel_lateral = xs_rel * lat_px_x + ys_rel * lat_px_y
+                            lateral_ok = (pixel_lateral >= min_lat) & (pixel_lateral <= max_lat)
+                except Exception:
+                    pass
+        
+        # Shade recovery region (for grass detection in shaded areas)
+        region_shade = self._shade_recovered[min_y:max_y, min_x:max_x]
+        
         # Base spatial filters: not on building/road, within distance,
-        # owned by this building, not already claimed by another pin
+        # owned by this building, not already claimed, not in border zone,
+        # and within the building's lateral corridor
         base_spatial = (
             (region_bld == 0) &
             (region_road == 0) &
             (region_owner == building_idx) &
             (region_bld_dist * self.meters_per_pixel <= max_garden_dist_m) &
-            (~claimed_region)
+            (~claimed_region) &
+            border_ok &
+            lateral_ok
         )
         
         # Opposite-side enforcement: exclude the half-plane containing
@@ -816,8 +882,19 @@ class DeliveryPinFinder:
             if np.any(candidates):
                 attempt_used = 3
         
-        # Within the selected candidates, prefer grass over paved (scoring handles rank)
-        grass_candidates = candidates & (region_veg > 0) & (~region_tree)
+        # Within the selected candidates, prefer grass over paved -- BUT only
+        # grass that is well within this property.  Grass near the ownership
+        # boundary is likely the neighbor's garden edge leaking in via the
+        # corridor tolerance.  Requiring a stricter edge distance for grass
+        # preference means paved gardens get their own pin instead of
+        # stealing the neighbor's grass.
+        grass_interior_m = config.PROPERTY_BORDER_WIDTH_M * 1.5
+        grass_interior_ok = region_edge_dist_m >= grass_interior_m
+        
+        grass_candidates = (candidates &
+                            ((region_veg > 0) | region_shade) &
+                            (~region_tree) &
+                            grass_interior_ok)
         if np.any(grass_candidates):
             large_enough = self._large_enough[region_labels]
             quality_grass = grass_candidates & large_enough & (region_density_large > 0.1)
@@ -830,7 +907,8 @@ class DeliveryPinFinder:
                     candidates = basic_grass
                 elif np.any(grass_candidates):
                     candidates = grass_candidates
-                # else: no grass → all candidates remain (paved/driveway scored lower)
+                # else: no interior grass → all candidates remain, scoring
+                # picks the best paved/driveway location for this property
         
         # Find best scoring candidate
         if not np.any(candidates):
@@ -848,8 +926,10 @@ class DeliveryPinFinder:
             py_abs = min_y + cy_r
             px_abs = min_x + cx_r
             
-            is_grass = (self.vegetation_mask[py_abs, px_abs] > 0 and
-                       not self._tree_mask[py_abs, px_abs])
+            is_shade_recovered = self._shade_recovered[py_abs, px_abs]
+            is_grass = ((self.vegetation_mask[py_abs, px_abs] > 0 and
+                        not self._tree_mask[py_abs, px_abs]) or
+                       is_shade_recovered)
             is_driveway = self.driveway_mask[py_abs, px_abs] > 0
             
             if is_grass:
@@ -887,11 +967,13 @@ class DeliveryPinFinder:
             if dist_road < 2:
                 scores[i] -= 10
             
-            # Property boundary penalty: push pins away from ownership
-            # edges where hedges/fences typically grow
+            # Property boundary penalty: graduated score reduction for pins
+            # approaching the border zone (hard exclusion is in base_spatial,
+            # this adds a softer falloff beyond the hard border)
             edge_dist_m = self._owner_edge_dist[py_abs, px_abs] * self.meters_per_pixel
-            if edge_dist_m < 1.5:
-                scores[i] -= min(15, (1.5 - edge_dist_m) * 10)
+            soft_border_m = config.PROPERTY_BORDER_WIDTH_M + 1.0
+            if edge_dist_m < soft_border_m:
+                scores[i] -= min(20, (soft_border_m - edge_dist_m) * 7)
             
             # Tree canopy penalty: ONLY for grass candidates.
             # Skipped for large images (arrays are scalar placeholders).
@@ -955,12 +1037,14 @@ class DeliveryPinFinder:
         circle = (yy**2 + xx**2) <= claim_r**2
         claimed[cy1:cy2, cx1:cx2] |= circle
         
-        # Determine surface type
+        # Determine surface type (including shade-recovered grass)
         if self.vegetation_mask[best_py, best_px] > 0:
             if self._tree_mask[best_py, best_px]:
                 surface = "tree"
             else:
                 surface = "grass"
+        elif self._shade_recovered[best_py, best_px]:
+            surface = "grass"
         elif self.driveway_mask[best_py, best_px] > 0:
             surface = "driveway"
         else:
@@ -1302,6 +1386,13 @@ class DeliveryPinFinder:
                 if not building_zone_mask[py, px]:
                     continue
                 
+                # Property border enforcement: skip pixels too close to
+                # the ownership boundary between adjacent houses
+                if hasattr(self, '_owner_edge_dist'):
+                    edge_dist_m = self._owner_edge_dist[py, px] * self.meters_per_pixel
+                    if edge_dist_m < config.PROPERTY_BORDER_WIDTH_M / 2:
+                        continue
+                
                 # Must be correct garden type
                 if self.classification_mask[py, px] != target_class:
                     continue
@@ -1312,9 +1403,9 @@ class DeliveryPinFinder:
                 ):
                     continue
                 
-                # LATERAL ALIGNMENT CHECK: For back gardens, pixel must be directly
-                # behind the building, not shifted sideways into neighbor's garden
-                if garden_type == "back" and not self._is_laterally_aligned(
+                # LATERAL ALIGNMENT CHECK: pixel must be within the building's
+                # width corridor, not shifted sideways into neighbor's garden
+                if not self._is_laterally_aligned(
                     px, py, building_idx, garden_type
                 ):
                     continue
@@ -1636,13 +1727,14 @@ class DeliveryPinFinder:
         py: int,
         building_idx: int,
         garden_type: str,
-        tolerance_m: float = 5.0
+        tolerance_m: float = 3.0
     ) -> bool:
         """
         Check if a pixel is laterally aligned with the building.
         
-        For back gardens in terraced/semi-detached houses, the garden should be
-        directly behind the building, not shifted sideways into neighbor's space.
+        The garden should be within the building's width corridor
+        (perpendicular to road direction), not shifted sideways into
+        a neighbor's space.
         
         We project the building's width perpendicular to the road direction,
         and check if the pixel falls within that corridor (plus tolerance).
@@ -1749,8 +1841,14 @@ class DeliveryPinFinder:
                 if self.classification_mask[py, px] != target_class:
                     continue
                 
-                # Lateral alignment check for back gardens
-                if garden_type == "back" and not self._is_laterally_aligned(
+                # Property border enforcement
+                if hasattr(self, '_owner_edge_dist'):
+                    edge_dist_m = self._owner_edge_dist[py, px] * self.meters_per_pixel
+                    if edge_dist_m < config.PROPERTY_BORDER_WIDTH_M / 2:
+                        continue
+                
+                # Lateral alignment: must be within building's width corridor
+                if not self._is_laterally_aligned(
                     px, py, building_idx, garden_type
                 ):
                     continue
